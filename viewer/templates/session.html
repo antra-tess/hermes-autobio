@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}{{ session_id }} · autobio viewer{% endblock %}
+{% block content %}
+<section class="session-bar">
+  <h1>{{ session_id }}</h1>
+  <span class="stats">
+    <strong>{{ stats.messages }}</strong> msgs ·
+    L1=<strong>{{ stats.summary_counts.get(1, 0) }}</strong> ·
+    L2=<strong>{{ stats.summary_counts.get(2, 0) }}</strong> ·
+    L3=<strong>{{ stats.summary_counts.get(3, 0) }}</strong>
+  </span>
+  <button id="refresh-btn" type="button">refresh</button>
+</section>
+
+<section class="session-grid">
+  <aside class="pane messages-pane">
+    <h2>Chronological messages</h2>
+    <div class="filters">
+      <label><input type="checkbox" id="hide-system-reminders"> hide &lt;system-reminder&gt;</label>
+    </div>
+    <ol id="messages-list" class="messages-list"></ol>
+  </aside>
+
+  <section class="pane tree-pane">
+    <h2>Memory hierarchy</h2>
+    <div class="tabs">
+      <button data-tab="hierarchy" class="tab active">hierarchy</button>
+      <button data-tab="cm" class="tab">CM dialogues</button>
+      <button data-tab="llm" class="tab">LLM calls</button>
+    </div>
+    <div id="tab-hierarchy" class="tab-body active">
+      <ul id="hierarchy-tree" class="tree"></ul>
+    </div>
+    <div id="tab-cm" class="tab-body">
+      <ol id="cm-events-list" class="cm-events-list"></ol>
+    </div>
+    <div id="tab-llm" class="tab-body">
+      <ol id="llm-calls-list" class="llm-calls-list"></ol>
+    </div>
+  </section>
+
+  <section class="pane detail-pane">
+    <h2>Detail</h2>
+    <div id="detail-body" class="detail-body">
+      <p class="hint">Select a message, summary, or CM event to inspect.</p>
+    </div>
+  </section>
+</section>
+
+<script>
+  window.SESSION_ID = {{ session_id|tojson }};
+</script>
+<script src="{{ url_for('static', filename='viewer.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{% block title %}autobio viewer{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='viewer.css') }}">
+</head>
+<body>
+  <header>
+    <a href="{{ url_for('index') }}" class="brand">autobio viewer</a>
+    <span class="hermes-home">hermes_home = <code>{{ hermes_home }}</code></span>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# This package is consumed by Hermes Agent as a plugin mounted at
+# `plugins/autobio/`. The metadata below is enough for an editable
+# install (`pip install -e ../hermes-autobio` from a hermes-agent
+# checkout); the canonical install path remains the git submodule.
+[project]
+name = "hermes-autobio"
+version = "0.1.0"
+description = "Hierarchical autobiographical memory plugin for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Anima research" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+# Runtime imports from hermes-agent core:
+#
+#   agent.context_engine.ContextEngine
+#   agent.memory_provider.MemoryProvider
+#   agent.model_metadata.{MINIMUM_CONTEXT_LENGTH, estimate_messages_tokens_rough}
+#   agent.auxiliary_client.call_llm
+#
+# Hermes-agent isn't on PyPI as of v0.10, so we don't list it as a
+# direct dependency. Mount this repo as a submodule of hermes-agent
+# (or pip-install it inside the same virtualenv as a hermes-agent
+# checkout) and the imports resolve.
+dependencies = [
+    "openai>=2.0.0",
+    "anthropic>=0.39.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+viewer = ["fastapi>=0.115", "uvicorn>=0.30", "jinja2>=3.1"]
+test = ["pytest>=9.0", "pytest-xdist>=3.0", "pytest-asyncio>=1.3"]
+
+[project.urls]
+"Spec" = "https://github.com/.../hermes-autobio/blob/main/docs/hierarchical-autobiographical-memory.md"
+
+# Setuptools needs to know that the top-level package is the repo
+# root (no nested src/ layout). The package becomes importable as
+# `plugins.autobio` only when mounted at hermes-agent/plugins/autobio/
+# — pip install gives you `hermes_autobio` instead, which is fine for
+# standalone development but not the way Hermes consumes the plugin.
+[tool.setuptools]
+packages = ["hermes_autobio"]
+package-dir = { "hermes_autobio" = "." }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "live: tests that hit a real LLM (require OPENROUTER_API_KEY).",
+]

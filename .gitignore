@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+.envrc
+
+# Fuzz reports — generated artifacts, keep out of version control.
+# Specific reports can be checked in by hand if they document a
+# regression we want to keep around.
+tests/autobio_fuzz/reports/
+
+# Local viewer state, exported memories.
+viewer_state.json
+exports/
+
+# Editor scratch.
+.idea/
+.vscode/
+*.swp
+*~

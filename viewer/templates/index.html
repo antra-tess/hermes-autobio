@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}sessions · autobio viewer{% endblock %}
+{% block content %}
+<section class="session-list">
+  <h1>Sessions</h1>
+  {% if not sessions %}
+    <p class="empty">No sessions found under <code>{{ hermes_home }}/memory/autobio/</code>.</p>
+  {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>session_id</th>
+          <th>messages</th>
+          <th>L1 / L2 / L3</th>
+          <th>pins</th>
+          <th>CM events</th>
+          <th>LLM calls</th>
+          <th>db</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in sessions %}
+        <tr>
+          <td><a href="{{ url_for('session', sid=s.session_id) }}">{{ s.session_id }}</a></td>
+          <td class="num">{{ s.messages }}</td>
+          <td class="num">{{ s.l1 }} / {{ s.l2 }} / {{ s.l3 }}</td>
+          <td class="num">{{ s.pins }}</td>
+          <td class="num">{{ s.cm_events }}</td>
+          <td class="num">{{ s.llm_calls }}</td>
+          <td class="db-path"><code>{{ s.db_path }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+{% endblock %}
