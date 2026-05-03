@@ -25,10 +25,22 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..")
-)
-if _REPO_ROOT not in sys.path:
+# Locate the host hermes-agent root: walk up from this file until we
+# find a directory containing ``agent/`` (the hermes-agent core
+# package). This works whether the autobio package lives in-tree at
+# ``hermes-agent/plugins/autobio/`` or is mounted there as a git
+# submodule. Falls back to the import-as-is path if we can't find it.
+def _find_hermes_root() -> str:
+    here = os.path.abspath(os.path.dirname(__file__))
+    while here != os.path.dirname(here):  # while not at filesystem root
+        if os.path.isdir(os.path.join(here, "agent")) and \
+           os.path.isfile(os.path.join(here, "agent", "context_engine.py")):
+            return here
+        here = os.path.dirname(here)
+    return ""
+
+_REPO_ROOT = _find_hermes_root()
+if _REPO_ROOT and _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from plugins.autobio.engine import AutobioContextEngine

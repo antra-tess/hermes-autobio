@@ -20,16 +20,27 @@ import argparse
 import os
 import sys
 
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..")
-)
-if _REPO_ROOT not in sys.path:
+# Walk up to find hermes-agent root (mirrors harness._find_hermes_root).
+def _find_hermes_root() -> str:
+    here = os.path.abspath(os.path.dirname(__file__))
+    while here != os.path.dirname(here):
+        if os.path.isdir(os.path.join(here, "agent")) and \
+           os.path.isfile(os.path.join(here, "agent", "context_engine.py")):
+            return here
+        here = os.path.dirname(here)
+    return ""
+
+_REPO_ROOT = _find_hermes_root()
+if _REPO_ROOT and _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from tests.plugins.autobio_fuzz.cm_scenarios import CM_SCENARIOS
-from tests.plugins.autobio_fuzz.generators import random_fuzz, scripted_narrative
-from tests.plugins.autobio_fuzz.harness import HarnessConfig, run_many
-from tests.plugins.autobio_fuzz.scenarios import ALL_SCENARIOS
+# Imports use the new module path (the autobio package is now mounted
+# at hermes-agent/plugins/autobio/). The old path
+# ``tests.plugins.autobio_fuzz`` no longer exists.
+from plugins.autobio.tests.autobio_fuzz.cm_scenarios import CM_SCENARIOS
+from plugins.autobio.tests.autobio_fuzz.generators import random_fuzz, scripted_narrative
+from plugins.autobio.tests.autobio_fuzz.harness import HarnessConfig, run_many
+from plugins.autobio.tests.autobio_fuzz.scenarios import ALL_SCENARIOS
 
 
 def main() -> int:
@@ -85,7 +96,7 @@ def main() -> int:
             print("ERROR: --replay-jsonl PATH is required for replay mode",
                   file=sys.stderr)
             return 2
-        from tests.plugins.autobio_fuzz.replay import load_claude_jsonl
+        from plugins.autobio.tests.autobio_fuzz.replay import load_claude_jsonl
         steps = load_claude_jsonl(
             args.replay_jsonl, max_records=args.replay_max_records,
         )
