@@ -1205,13 +1205,16 @@ def _merge_batch(
     compression_cfg: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Merge a batch of summaries into one at ``new_level``."""
-    # Build an instruction-shaped prompt with each source summary as a
-    # user message. Keep it simple — no marker trick needed for merges
-    # since the model has no tail state to preserve here.
+    # Each source memory is presented as ``role=assistant`` because it
+    # IS the agent's own first-person recall — putting agent-origin
+    # content under ``user`` would tell the merge LLM "the user said
+    # this happened" rather than "the agent recalls this happening."
+    # The merge instruction itself stays ``user`` (it's a synthetic
+    # task spec, not agent-origin content).
     prompt_messages: List[Dict[str, str]] = []
     for i, s in enumerate(batch, 1):
         prompt_messages.append({
-            "role": "user",
+            "role": "assistant",
             "content": f"MEMORY {i}/{len(batch)} ({s['id']}):\n{s['content']}",
         })
     prompt_messages.append({
@@ -1484,10 +1487,18 @@ def _build_kv_preserving_prompt(
 
     # Prior summaries, oldest level first. All predate the chunk because
     # compression is strictly chronological.
+    #
+    # role=assistant: these memories ARE the agent's first-person recall
+    # of earlier conversation. Presenting them as ``user`` would tell
+    # the summarizer "the user told me X happened" rather than "I
+    # remember X happening" — a meaningful KV-level distortion. The
+    # strict role-alternation rule no longer applies (Anthropic
+    # accepts consecutive assistants), so we can be honest about
+    # speaker identity here.
     for level in (3, 2, 1):
         for s in store.list_summaries(level, include_merged=False):
             prompt.append({
-                "role": "user",
+                "role": "assistant",
                 "content": f"MEMORY {s['id']} (gen {s['compression_generations']}):\n{s['content']}",
             })
 
@@ -1713,16 +1724,20 @@ def _make_summary_marker(summary_id: str, summary: str, level: int) -> Dict[str,
     instead of shrink on fold and let the picker recursively fold its
     own output.
 
-    Uses ``role=user`` so the sequence stays alternating even when the
-    folded chunk ended on an assistant message. The ``_autobio_marker``
-    flag lets reconcile paths recognize markers by schema; the prefix
-    ``[autobio:memory`` is a fallback for round-trips that drop unknown
-    keys.
+    Uses ``role=assistant`` because the marker stands in for content
+    the AGENT itself produced (folded autobiographical memory).
+    Anthropic dropped the strict role-alternation requirement, so we
+    no longer need the ``role=user`` workaround to sidestep
+    "two assistants in a row" rejections.
+
+    The ``_autobio_marker`` flag lets reconcile paths recognize
+    markers by schema; the prefix ``[autobio:memory`` is a fallback
+    for round-trips that drop unknown keys.
     """
     from .render import _MARKER_FLAG
     tokens_hint = max(1, len(summary) // _CHARS_PER_TOKEN) if summary else 0
     return {
-        "role": "user",
+        "role": "assistant",
         "content": (
             f"[autobio:memory {summary_id} · L{level} · {tokens_hint}t · "
             f"call cm_manage_context to expand]"

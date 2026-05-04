@@ -664,5 +664,136 @@ class ChunkAlignment(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class AgentOriginRoleHonesty(unittest.TestCase):
+    """Hard rule: content the agent itself produced (memories, markers,
+    folded-conversation summaries) must NEVER be presented under
+    ``role=user``. Wrapping agent-origin content as user-input
+    misrepresents the speaker at the KV level — the model would
+    attend to its own memory as if the user had said it.
+
+    Anthropic's API dropped the strict role-alternation requirement
+    that previously forced the ``role=user`` workaround; consecutive
+    assistant turns concatenate naturally.
+    """
+
+    def test_render_marker_is_assistant_role(self) -> None:
+        from plugins.autobio.render import _make_marker
+        marker = _make_marker({
+            "id": "L1-0001", "level": 1, "tokens": 800,
+            "compression_generations": 1, "content": "x",
+        })
+        self.assertEqual(
+            marker.get("role"), "assistant",
+            "live-view marker must be assistant role — it stands in "
+            "for content the agent produced",
+        )
+
+    def test_legacy_summary_marker_is_assistant_role(self) -> None:
+        from plugins.autobio.compression import _make_summary_marker
+        marker = _make_summary_marker("L1-0042", "memory body", level=1)
+        self.assertEqual(marker.get("role"), "assistant")
+
+    def test_summarizer_prompt_memories_are_assistant_role(self) -> None:
+        """Prior summaries shown to the auxiliary summarizer (when
+        producing a new L1) must be assistant role — they're the
+        agent's first-person recall."""
+        import tempfile, shutil
+        from plugins.autobio.compression import _build_kv_preserving_prompt
+        from plugins.autobio.store import close_store, get_store
+
+        tmp = tempfile.mkdtemp(prefix="autobio_role_")
+        try:
+            store = get_store(tmp, "role")
+            store.insert_summary(
+                level=1, source_hashes=["h0"], source_hash="s0",
+                content="I remember reading the spec.",
+                tokens=100, compression_generations=1,
+            )
+            messages = [
+                {"role": "user", "content": "go on"},
+                {"role": "assistant", "content": "OK"},
+            ]
+            prompt = _build_kv_preserving_prompt(
+                messages=messages, chunk_start=0, chunk_end=2,
+                store=store, target_tokens=300,
+            )
+            mem_lines = [m for m in prompt
+                         if isinstance(m.get("content"), str)
+                         and m["content"].startswith("MEMORY L1-")]
+            self.assertGreater(len(mem_lines), 0)
+            for m in mem_lines:
+                self.assertEqual(
+                    m.get("role"), "assistant",
+                    f"prior summary must be assistant role: {m}",
+                )
+            store.close()
+            close_store(tmp, "role")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_merge_batch_memories_are_assistant_role(self) -> None:
+        """When merging L1s into L2, each child memory in the merge
+        prompt must be assistant role."""
+        from unittest.mock import MagicMock, patch
+        import tempfile, shutil
+        from plugins.autobio.compression import ModelInfo, merge_if_ready
+        from plugins.autobio.ids import message_hash
+        from plugins.autobio.store import close_store, get_store
+
+        tmp = tempfile.mkdtemp(prefix="autobio_merge_role_")
+        try:
+            store = get_store(tmp, "mr")
+            # Insert backing messages so the contiguity check passes.
+            for i in range(6):
+                m = {"role": "user" if i % 2 == 0 else "assistant",
+                     "content": f"m{i}"}
+                store.upsert_message(message_hash(m), m, turn=i, position=i)
+            # Insert 3 L1s, each covering 2 messages contiguously.
+            for k in range(3):
+                hashes = [message_hash({"role": "user" if (2*k) % 2 == 0 else "assistant",
+                                        "content": f"m{2*k}"}),
+                          message_hash({"role": "user" if (2*k+1) % 2 == 0 else "assistant",
+                                        "content": f"m{2*k+1}"})]
+                sid = store.insert_summary(
+                    level=1, source_hashes=hashes, source_hash=f"sh{k}",
+                    content=f"first-person recall #{k}",
+                    tokens=50, compression_generations=1,
+                )
+                store.mark_compressed(hashes, sid)
+
+            captured_prompts = []
+            def capture(**kw):
+                captured_prompts.append(kw.get("messages") or [])
+                resp = MagicMock()
+                resp.choices = [MagicMock()]
+                resp.choices[0].message.content = "merged"
+                return resp
+
+            with patch("agent.auxiliary_client.call_llm", side_effect=capture):
+                cfg = {"compression": {"merge_threshold": 3, "max_levels": 3,
+                                       "summary_target_tokens": 100}}
+                merge_if_ready(store, cfg, ModelInfo(model="t"))
+
+            self.assertGreater(len(captured_prompts), 0)
+            mem_msgs = [
+                m for m in captured_prompts[0]
+                if isinstance(m.get("content"), str)
+                and m["content"].startswith("MEMORY ")
+                and "/" in m["content"][:25]  # MEMORY 1/3 (...) format
+            ]
+            self.assertGreater(len(mem_msgs), 0,
+                               "expected MEMORY entries in merge prompt")
+            for m in mem_msgs:
+                self.assertEqual(
+                    m.get("role"), "assistant",
+                    f"merge-prompt memory entry must be assistant: {m}",
+                )
+
+            store.close()
+            close_store(tmp, "mr")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

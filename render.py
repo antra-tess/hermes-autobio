@@ -264,6 +264,16 @@ def _make_marker(summary: Dict[str, Any]) -> Dict[str, Any]:
     short hint about how to fetch the full content. NOT the full L1
     body — that lives in the archive and is fetched on demand.
 
+    Uses ``role=assistant`` because the marker stands in for content
+    the AGENT itself produced — the folded conversation summarized as
+    the agent's autobiographical memory. Wrapping agent-origin
+    content behind a ``user`` role would misrepresent the speaker at
+    the KV level: the model would attend to its own memory as if the
+    user had said it. The strict role-alternation rule that
+    previously forced ``user`` here was dropped by Anthropic's API
+    (consecutive assistant turns concatenate naturally), so we no
+    longer need that workaround.
+
     The dict carries an explicit ``_autobio_marker`` flag so reconcile
     paths can recognize markers by schema rather than content prefix.
     """
@@ -275,7 +285,7 @@ def _make_marker(summary: Dict[str, Any]) -> Dict[str, Any]:
         f"{_MARKER_PREFIX}{sid} · L{level} · {tokens}t · gen {gen} · "
         f"call cm_manage_context to expand]"
     )
-    return {"role": "user", "content": body, _MARKER_FLAG: True}
+    return {"role": "assistant", "content": body, _MARKER_FLAG: True}
 
 
 def _msg_to_openai(row: Dict[str, Any]) -> Dict[str, Any]:
