@@ -264,15 +264,22 @@ def _make_marker(summary: Dict[str, Any]) -> Dict[str, Any]:
     short hint about how to fetch the full content. NOT the full L1
     body — that lives in the archive and is fetched on demand.
 
-    Uses ``role=assistant`` because the marker stands in for content
-    the AGENT itself produced — the folded conversation summarized as
-    the agent's autobiographical memory. Wrapping agent-origin
-    content behind a ``user`` role would misrepresent the speaker at
-    the KV level: the model would attend to its own memory as if the
-    user had said it. The strict role-alternation rule that
-    previously forced ``user`` here was dropped by Anthropic's API
-    (consecutive assistant turns concatenate naturally), so we no
-    longer need that workaround.
+    Uses ``role=user`` because the marker is a synthetic header in CM's
+    voice, NOT content produced by the agent. The agent's actual
+    memory body lives in the archive (fetched via cm_manage_context)
+    and would belong in an assistant turn if/when surfaced. Putting
+    the bare structural pointer under ``assistant`` would falsely
+    attribute system metadata to the agent.
+
+    The full layout when memories are presented inline (not just as a
+    pointer — see ``_build_kv_preserving_prompt``) is a two-turn
+    dialogue:
+
+        user (CM):     Recall memory L1-0042.
+        assistant:     <first-person body>
+
+    The live-view marker is just the header half (no body), since
+    the body sits in the archive until CM expands it.
 
     The dict carries an explicit ``_autobio_marker`` flag so reconcile
     paths can recognize markers by schema rather than content prefix.
@@ -285,7 +292,7 @@ def _make_marker(summary: Dict[str, Any]) -> Dict[str, Any]:
         f"{_MARKER_PREFIX}{sid} · L{level} · {tokens}t · gen {gen} · "
         f"call cm_manage_context to expand]"
     )
-    return {"role": "assistant", "content": body, _MARKER_FLAG: True}
+    return {"role": "user", "content": body, _MARKER_FLAG: True}
 
 
 def _msg_to_openai(row: Dict[str, Any]) -> Dict[str, Any]:

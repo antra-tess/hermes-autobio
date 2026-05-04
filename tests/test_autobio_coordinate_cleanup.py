@@ -665,38 +665,50 @@ class ChunkAlignment(unittest.TestCase):
 
 
 class AgentOriginRoleHonesty(unittest.TestCase):
-    """Hard rule: content the agent itself produced (memories, markers,
-    folded-conversation summaries) must NEVER be presented under
-    ``role=user``. Wrapping agent-origin content as user-input
-    misrepresents the speaker at the KV level — the model would
-    attend to its own memory as if the user had said it.
+    """Two hard rules govern role assignment in autobio prompts:
 
-    Anthropic's API dropped the strict role-alternation requirement
-    that previously forced the ``role=user`` workaround; consecutive
-    assistant turns concatenate naturally.
+    1. **Bodies of agent-produced content** (memories, summaries —
+       first-person recall the agent actually voiced) MUST be
+       presented under ``role=assistant``. Wrapping them as user
+       input would tell the model "the user said this happened"
+       rather than "I recall this happening" — a meaningful KV-level
+       distortion.
+
+    2. **Headers / synthetic labels** (``MEMORY L1-...``, ``[autobio:
+       memory ...]``, "[CM] Recall ...") are NOT produced by the
+       LLM. They MUST go in ``role=user`` (CM's voice asking the
+       agent to recall a memory) — putting them under assistant
+       would falsely attribute system metadata to the agent.
+
+    The result is a CM-asks / agent-recalls dialogue: each memory in
+    a prompt is rendered as ``[user: header] [assistant: body]``.
+    Anthropic dropped strict role-alternation, so consecutive
+    same-role turns are fine — we don't need workarounds.
     """
 
-    def test_render_marker_is_assistant_role(self) -> None:
+    def test_render_marker_is_user_role_header(self) -> None:
+        """The live-view marker is a header-only artifact (the body
+        lives in the archive). Headers are CM-voice, so user role.
+        """
         from plugins.autobio.render import _make_marker
         marker = _make_marker({
             "id": "L1-0001", "level": 1, "tokens": 800,
             "compression_generations": 1, "content": "x",
         })
         self.assertEqual(
-            marker.get("role"), "assistant",
-            "live-view marker must be assistant role — it stands in "
-            "for content the agent produced",
+            marker.get("role"), "user",
+            "live-view marker is a header from CM, not agent recall",
         )
 
-    def test_legacy_summary_marker_is_assistant_role(self) -> None:
+    def test_legacy_summary_marker_is_user_role_header(self) -> None:
         from plugins.autobio.compression import _make_summary_marker
         marker = _make_summary_marker("L1-0042", "memory body", level=1)
-        self.assertEqual(marker.get("role"), "assistant")
+        self.assertEqual(marker.get("role"), "user")
 
-    def test_summarizer_prompt_memories_are_assistant_role(self) -> None:
-        """Prior summaries shown to the auxiliary summarizer (when
-        producing a new L1) must be assistant role — they're the
-        agent's first-person recall."""
+    def test_summarizer_prompt_uses_dialogue_pattern(self) -> None:
+        """Prior summaries shown to the summarizer must be split into
+        a CM-voiced user header + assistant body pair, not a single
+        wrapped 'MEMORY L1-X: <body>' message."""
         import tempfile, shutil
         from plugins.autobio.compression import _build_kv_preserving_prompt
         from plugins.autobio.store import close_store, get_store
@@ -704,9 +716,10 @@ class AgentOriginRoleHonesty(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="autobio_role_")
         try:
             store = get_store(tmp, "role")
+            body = "I remember reading the spec."
             store.insert_summary(
                 level=1, source_hashes=["h0"], source_hash="s0",
-                content="I remember reading the spec.",
+                content=body,
                 tokens=100, compression_generations=1,
             )
             messages = [
@@ -717,23 +730,35 @@ class AgentOriginRoleHonesty(unittest.TestCase):
                 messages=messages, chunk_start=0, chunk_end=2,
                 store=store, target_tokens=300,
             )
-            mem_lines = [m for m in prompt
-                         if isinstance(m.get("content"), str)
-                         and m["content"].startswith("MEMORY L1-")]
-            self.assertGreater(len(mem_lines), 0)
-            for m in mem_lines:
-                self.assertEqual(
-                    m.get("role"), "assistant",
-                    f"prior summary must be assistant role: {m}",
-                )
+
+            # Find the header (user, says "Recall memory L1-...") and
+            # immediately-following body (assistant, contains the recall).
+            for i, m in enumerate(prompt):
+                content = m.get("content") or ""
+                if isinstance(content, str) and "Recall memory L1-" in content:
+                    self.assertEqual(
+                        m.get("role"), "user",
+                        f"recall header must be user role: {m}",
+                    )
+                    # Next message should be assistant body.
+                    self.assertLess(i + 1, len(prompt))
+                    nxt = prompt[i + 1]
+                    self.assertEqual(
+                        nxt.get("role"), "assistant",
+                        f"recall body must be assistant role: {nxt}",
+                    )
+                    self.assertEqual(nxt.get("content"), body)
+                    break
+            else:
+                self.fail("no recall header found in summarizer prompt")
             store.close()
             close_store(tmp, "role")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_merge_batch_memories_are_assistant_role(self) -> None:
+    def test_merge_prompt_uses_dialogue_pattern(self) -> None:
         """When merging L1s into L2, each child memory in the merge
-        prompt must be assistant role."""
+        prompt is split into [user header + assistant body]."""
         from unittest.mock import MagicMock, patch
         import tempfile, shutil
         from plugins.autobio.compression import ModelInfo, merge_if_ready
@@ -743,12 +768,10 @@ class AgentOriginRoleHonesty(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="autobio_merge_role_")
         try:
             store = get_store(tmp, "mr")
-            # Insert backing messages so the contiguity check passes.
             for i in range(6):
                 m = {"role": "user" if i % 2 == 0 else "assistant",
                      "content": f"m{i}"}
                 store.upsert_message(message_hash(m), m, turn=i, position=i)
-            # Insert 3 L1s, each covering 2 messages contiguously.
             for k in range(3):
                 hashes = [message_hash({"role": "user" if (2*k) % 2 == 0 else "assistant",
                                         "content": f"m{2*k}"}),
@@ -775,19 +798,30 @@ class AgentOriginRoleHonesty(unittest.TestCase):
                 merge_if_ready(store, cfg, ModelInfo(model="t"))
 
             self.assertGreater(len(captured_prompts), 0)
-            mem_msgs = [
-                m for m in captured_prompts[0]
-                if isinstance(m.get("content"), str)
-                and m["content"].startswith("MEMORY ")
-                and "/" in m["content"][:25]  # MEMORY 1/3 (...) format
-            ]
-            self.assertGreater(len(mem_msgs), 0,
-                               "expected MEMORY entries in merge prompt")
-            for m in mem_msgs:
-                self.assertEqual(
-                    m.get("role"), "assistant",
-                    f"merge-prompt memory entry must be assistant: {m}",
-                )
+            prompt = captured_prompts[0]
+
+            # Every "Recall memory N/3 (L1-...)" header is user role,
+            # and the very next message is the assistant body.
+            found = 0
+            for i, m in enumerate(prompt):
+                c = m.get("content") or ""
+                if isinstance(c, str) and "Recall memory" in c and "/" in c:
+                    self.assertEqual(
+                        m.get("role"), "user",
+                        f"merge header must be user role: {m}",
+                    )
+                    self.assertLess(i + 1, len(prompt))
+                    nxt = prompt[i + 1]
+                    self.assertEqual(
+                        nxt.get("role"), "assistant",
+                        f"merge body must be assistant role: {nxt}",
+                    )
+                    self.assertIn("first-person recall", nxt.get("content"))
+                    found += 1
+            self.assertEqual(
+                found, 3,
+                f"expected 3 [user header / assistant body] pairs, got {found}",
+            )
 
             store.close()
             close_store(tmp, "mr")

@@ -1205,17 +1205,21 @@ def _merge_batch(
     compression_cfg: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Merge a batch of summaries into one at ``new_level``."""
-    # Each source memory is presented as ``role=assistant`` because it
-    # IS the agent's own first-person recall — putting agent-origin
-    # content under ``user`` would tell the merge LLM "the user said
-    # this happened" rather than "the agent recalls this happening."
-    # The merge instruction itself stays ``user`` (it's a synthetic
-    # task spec, not agent-origin content).
+    # Each source memory is narrativized as a CM-asks / agent-recalls
+    # pair: the header (CM voice, user role) sets up which memory is
+    # being recalled, the body (agent voice, assistant role) is the
+    # first-person content. This honors both invariants — bodies are
+    # the agent's own recall, headers are synthetic labels not
+    # produced by the LLM.
     prompt_messages: List[Dict[str, str]] = []
     for i, s in enumerate(batch, 1):
         prompt_messages.append({
+            "role": "user",
+            "content": f"[CM] Recall memory {i}/{len(batch)} ({s['id']}).",
+        })
+        prompt_messages.append({
             "role": "assistant",
-            "content": f"MEMORY {i}/{len(batch)} ({s['id']}):\n{s['content']}",
+            "content": s["content"],
         })
     prompt_messages.append({
         "role": "user",
@@ -1488,18 +1492,34 @@ def _build_kv_preserving_prompt(
     # Prior summaries, oldest level first. All predate the chunk because
     # compression is strictly chronological.
     #
-    # role=assistant: these memories ARE the agent's first-person recall
-    # of earlier conversation. Presenting them as ``user`` would tell
-    # the summarizer "the user told me X happened" rather than "I
-    # remember X happening" — a meaningful KV-level distortion. The
-    # strict role-alternation rule no longer applies (Anthropic
-    # accepts consecutive assistants), so we can be honest about
-    # speaker identity here.
+    # Each memory is narrativized as a two-turn dialogue: CM asks the
+    # agent to recall a specific memory (user role), and the agent
+    # answers with the first-person memory body (assistant role).
+    # Rationale:
+    #
+    #   - Bodies are the agent's autobiographical recall — putting
+    #     them under user role would tell the model "the user told me
+    #     X happened" rather than "I remember X."
+    #   - Headers ("MEMORY L1-..."  / "Recall L1-...") are NOT
+    #     produced by the LLM — they're system labels. Putting them
+    #     under assistant role would falsely attribute synthetic
+    #     metadata to the agent.
+    #
+    # Splitting header into a CM-voiced user turn + body into an
+    # assistant turn satisfies both: the dialogue reads naturally,
+    # KV state attributes each speaker honestly.
     for level in (3, 2, 1):
         for s in store.list_summaries(level, include_merged=False):
             prompt.append({
+                "role": "user",
+                "content": (
+                    f"[CM] Recall memory {s['id']} "
+                    f"(gen {s['compression_generations']})."
+                ),
+            })
+            prompt.append({
                 "role": "assistant",
-                "content": f"MEMORY {s['id']} (gen {s['compression_generations']}):\n{s['content']}",
+                "content": s["content"],
             })
 
     # Head only — everything before the chunk. No tail_after_chunk.
@@ -1724,11 +1744,10 @@ def _make_summary_marker(summary_id: str, summary: str, level: int) -> Dict[str,
     instead of shrink on fold and let the picker recursively fold its
     own output.
 
-    Uses ``role=assistant`` because the marker stands in for content
-    the AGENT itself produced (folded autobiographical memory).
-    Anthropic dropped the strict role-alternation requirement, so we
-    no longer need the ``role=user`` workaround to sidestep
-    "two assistants in a row" rejections.
+    Uses ``role=user`` because the marker is a synthetic CM-voice
+    pointer, not content produced by the agent. The agent's actual
+    memory body lives in the archive (and would land in an
+    assistant turn if/when surfaced via cm_manage_context).
 
     The ``_autobio_marker`` flag lets reconcile paths recognize
     markers by schema; the prefix ``[autobio:memory`` is a fallback
@@ -1737,7 +1756,7 @@ def _make_summary_marker(summary_id: str, summary: str, level: int) -> Dict[str,
     from .render import _MARKER_FLAG
     tokens_hint = max(1, len(summary) // _CHARS_PER_TOKEN) if summary else 0
     return {
-        "role": "assistant",
+        "role": "user",
         "content": (
             f"[autobio:memory {summary_id} · L{level} · {tokens_hint}t · "
             f"call cm_manage_context to expand]"
