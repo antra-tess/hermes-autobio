@@ -530,6 +530,75 @@ class HashIdempotency(unittest.TestCase):
             combined_hash(["c", "b", "a"]),
         )
 
+    def test_reasoning_details_distinguishes_otherwise_identical_messages(self) -> None:
+        """Two assistant messages whose only emitted content is a
+        ``thinking`` block (empty narration, no tool calls) must hash
+        distinctly when the thinking blocks differ.
+
+        Regression test for the hash-collision bug found during real
+        Claude Code session ingestion: 100+ assistant turns whose
+        only content was extended-thinking blocks all collided to a
+        single hash, causing 99% of them to be silently dedup-skipped
+        on insert. Including ``reasoning_details`` in the hash is what
+        keeps these turns distinct.
+        """
+        from plugins.autobio.ids import message_hash
+
+        empty_assistant = {"role": "assistant", "content": ""}
+        h_empty = message_hash(empty_assistant)
+
+        thinking_a = {
+            "role": "assistant", "content": "",
+            "reasoning_details": [{
+                "type": "thinking",
+                "thinking": "Approach A: try the direct path.",
+                "signature": "sigA",
+            }],
+        }
+        thinking_b = {
+            "role": "assistant", "content": "",
+            "reasoning_details": [{
+                "type": "thinking",
+                "thinking": "Approach B: maybe a workaround.",
+                "signature": "sigB",
+            }],
+        }
+        h_a = message_hash(thinking_a)
+        h_b = message_hash(thinking_b)
+
+        # Each thinking variant must be distinct from the empty one
+        # AND from each other.
+        self.assertNotEqual(h_a, h_empty,
+                            "thinking-only message hashed same as empty assistant")
+        self.assertNotEqual(h_b, h_empty)
+        self.assertNotEqual(h_a, h_b,
+                            "two different thinking blocks collapsed to one hash")
+
+        # Same thinking block → same hash (idempotent).
+        thinking_a_again = dict(thinking_a)
+        self.assertEqual(message_hash(thinking_a_again), h_a)
+
+        # Block ordering matters — sequence is part of identity.
+        thinking_ab = {
+            "role": "assistant", "content": "",
+            "reasoning_details": [
+                thinking_a["reasoning_details"][0],
+                thinking_b["reasoning_details"][0],
+            ],
+        }
+        thinking_ba = {
+            "role": "assistant", "content": "",
+            "reasoning_details": [
+                thinking_b["reasoning_details"][0],
+                thinking_a["reasoning_details"][0],
+            ],
+        }
+        self.assertNotEqual(
+            message_hash(thinking_ab),
+            message_hash(thinking_ba),
+            "block order in reasoning_details must affect hash",
+        )
+
 
 class Documents(unittest.TestCase):
     """Document (kind=doc_*) pin behavior and the auto-detect pipeline."""

@@ -25,10 +25,20 @@ _HASH_LEN = 16  # 64 bits; collision risk negligible at realistic scale
 def message_hash(message: Dict[str, Any]) -> str:
     """Return the stable content-hash ID for a single message dict.
 
-    The hash input is a canonicalized JSON of (role, content, tool_call_id,
-    tool_calls). Assistant messages with tool_calls include their call IDs
-    and function names + args so two otherwise-identical assistant
-    messages with different tool calls produce distinct hashes.
+    The hash input is a canonicalized JSON of (role, content,
+    tool_call_id, tool_name, tool_calls, reasoning_details). Assistant
+    messages with tool_calls include their call IDs and function names
+    + args so two otherwise-identical assistant messages with different
+    tool calls produce distinct hashes.
+
+    ``reasoning_details`` covers Anthropic's ``thinking`` and
+    ``redacted_thinking`` blocks. Without it in the hash, an assistant
+    turn whose only emitted content is reasoning (no narration text,
+    no tool calls — common during long extended-thinking sessions)
+    hashes identically to every other empty assistant turn. All such
+    turns then collapse to one row on insert, silently dropping the
+    thinking content. Including reasoning_details keeps each turn
+    distinct by its actual KV-affecting payload.
     """
     payload = {
         "role": message.get("role", ""),
@@ -36,6 +46,9 @@ def message_hash(message: Dict[str, Any]) -> str:
         "tool_call_id": message.get("tool_call_id", ""),
         "tool_name": message.get("name", ""),
         "tool_calls": _normalize_tool_calls(message.get("tool_calls")),
+        "reasoning_details": _normalize_reasoning(
+            message.get("reasoning_details"),
+        ),
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:_HASH_LEN]
@@ -72,6 +85,27 @@ def _normalize_content_block(block: Any) -> Any:
     if isinstance(block, dict):
         return {k: block[k] for k in sorted(block.keys())}
     return str(block)
+
+
+def _normalize_reasoning(reasoning: Any) -> List[Dict[str, Any]]:
+    """Normalize reasoning_details (thinking blocks) for hashing.
+
+    Each block is a dict like ``{type: "thinking", thinking: "...",
+    signature: "..."}`` (Anthropic's format) or ``{type:
+    "redacted_thinking", data: "..."}``. We sort keys per block so two
+    semantically equal blocks hash identically regardless of dict
+    insertion order. Blocks themselves are kept in the original list
+    order — the sequence of thoughts is part of identity.
+    """
+    if not reasoning:
+        return []
+    out = []
+    for blk in reasoning:
+        if isinstance(blk, dict):
+            out.append({k: blk[k] for k in sorted(blk.keys())})
+        else:
+            out.append(str(blk))
+    return out
 
 
 def _normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
