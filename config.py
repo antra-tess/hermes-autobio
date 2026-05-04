@@ -21,7 +21,16 @@ DEFAULTS: Dict[str, Any] = {
         "max_tokens": 150_000,
     },
     "compression": {
-        "chunk_tokens": 10_000,
+        # Weighted-token budget the picker accumulates per L1. Lower
+        # values produce more, smaller, denser L1s (faster L2/L3
+        # hierarchy formation, more granular memory recall); higher
+        # values produce fewer, coarser L1s (looser memory granularity).
+        # 6k weighted tokens is the current default — chosen because
+        # for tool-heavy Claude Code-style workflows it lands ~10 L1s
+        # per 250k-token session, comfortably triggering the L2 merge
+        # at threshold=6. Tune via ``autobio.compression.chunk_tokens``
+        # in user config.
+        "chunk_tokens": 6_000,
         "summary_target_tokens": 2_500,
         "merge_threshold": 6,
         "max_levels": 3,
@@ -44,10 +53,28 @@ DEFAULTS: Dict[str, Any] = {
             "assistant": 1.0,
             "system": 1.0,
             "tool_default": 0.5,    # most tools (search, MCP, web fetch)
-            "tool_by_name": {       # cheap-to-recover tool outputs
+            # Tool-specific weights. Names ending in ``:ext`` (set at
+            # archive time by ``tool_naming.enrich_tool_name``) take
+            # precedence; bare names are the fallback. So ``Read:py``
+            # resolves to ``Read`` (0.1) but ``Read:md`` resolves to
+            # the explicit ``Read:md`` entry below (0.5).
+            "tool_by_name": {
+                # Code reads / console output: cheap to recover, the
+                # L1 just needs to remember "I explored X".
                 "Read": 0.1, "Bash": 0.1, "Grep": 0.1, "Glob": 0.1,
                 "ls": 0.1, "cat": 0.1, "head": 0.1, "tail": 0.1,
                 "terminal": 0.1, "read_file": 0.1, "search_files": 0.1,
+                # Document reads: the content IS what the model is
+                # thinking about, so it gets full weight (treat the
+                # text as conversational input rather than a
+                # consultable artifact). Add more extensions here as
+                # needed; anything not listed falls back to ``Read``.
+                "Read:md": 0.5, "Read:rst": 0.5, "Read:txt": 0.5,
+                "Read:org": 0.5, "Read:adoc": 0.5, "Read:tex": 0.5,
+                "read_file:md": 0.5, "read_file:rst": 0.5,
+                "read_file:txt": 0.5,
+                # Web — partial recovery; the URL stays but the page
+                # might disappear, so we keep more in the L1.
                 "WebFetch": 0.5, "WebSearch": 0.5,
             },
         },

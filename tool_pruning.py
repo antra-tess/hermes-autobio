@@ -96,18 +96,30 @@ def prune_tool_results(
     archived_ok: set[int] = set()
     archive_failures: List["tuple[int, str]"] = []
     if store is not None:
+        from .tool_naming import build_tool_args_index, enrich_tool_name
+        args_index = build_tool_args_index(messages)
         for i, msg in enumerate(messages):
             if msg.get("role") != "tool":
                 continue
             try:
-                h = message_hash(msg)
                 content = msg.get("content", "")
                 content_str = content if isinstance(content, str) else json.dumps(content)
-                # Tag the archived row with its resolved tool_name so
-                # uncompression queries don't need to re-resolve via
-                # assistant messages that may be pruned later.
-                enriched = dict(msg)
-                enriched.setdefault("name", id_to_tool.get(msg.get("tool_call_id", ""), ("unknown", ""))[0])
+                # Enrich tool_name with file-ext suffix for Read-family
+                # tools BEFORE hashing so the hash and the stored row
+                # agree, and so the picker's per-tool weight lookup can
+                # tell ``Read:md`` (document — full weight) apart from
+                # ``Read:py`` (source code — discounted).
+                enriched = enrich_tool_name(msg, args_index)
+                # Defensive default: if the args index didn't carry a
+                # name (corrupt transcript, missing tool_call), at
+                # least set ``unknown`` so downstream queries don't
+                # confuse missing-name with empty content.
+                if not enriched.get("name"):
+                    enriched = dict(enriched)
+                    enriched["name"] = id_to_tool.get(
+                        msg.get("tool_call_id", ""), ("unknown", ""),
+                    )[0] or "unknown"
+                h = message_hash(enriched)
                 store.upsert_message(
                     h, enriched,
                     turn=current_turn, position=i,

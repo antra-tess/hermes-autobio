@@ -442,5 +442,227 @@ class MergeContiguity(unittest.TestCase):
         store.close()
 
 
+# ---------------------------------------------------------------------------
+# Tool-name enrichment (Read:ext suffix) + hierarchical weight lookup
+# ---------------------------------------------------------------------------
+
+class ToolNameEnrichment(unittest.TestCase):
+    """Read-family tool results carry a ``:ext`` suffix on ``name`` so
+    the picker's per-tool weight can distinguish documents from code.
+    """
+
+    def test_synthesize_tool_name_only_tags_read_family(self) -> None:
+        from plugins.autobio.tool_naming import synthesize_tool_name
+
+        # Read variants → tagged with extension.
+        self.assertEqual(
+            synthesize_tool_name("Read", {"file_path": "/x/y/foo.md"}),
+            "Read:md",
+        )
+        self.assertEqual(
+            synthesize_tool_name("read_file", {"path": "doc.rst"}),
+            "read_file:rst",
+        )
+        # Read of an extensionless file → bare name (no false suffix).
+        self.assertEqual(
+            synthesize_tool_name("Read", {"file_path": "/etc/hosts"}),
+            "Read",
+        )
+        self.assertEqual(
+            synthesize_tool_name("Read", {}),
+            "Read",
+        )
+        # Other tools pass through unchanged regardless of args.
+        self.assertEqual(
+            synthesize_tool_name("Bash", {"file_path": "/a.py"}),
+            "Bash",
+        )
+        self.assertEqual(
+            synthesize_tool_name("WebFetch", {"url": "x.com"}),
+            "WebFetch",
+        )
+
+    def test_resolve_tool_weight_hierarchical(self) -> None:
+        """Lookup tries exact match first, then strips the ``:ext`` and
+        falls back to the bare tool, then to ``tool_default``."""
+        from plugins.autobio.compression import _resolve_tool_weight
+
+        cfg = {
+            "tool_default": 0.5,
+            "tool_by_name": {
+                "Read": 0.1,
+                "Read:md": 0.5,
+                "Bash": 0.1,
+            },
+        }
+        # Exact match wins.
+        self.assertEqual(_resolve_tool_weight("Read:md", cfg), 0.5)
+        # Suffix not in config → falls to bare prefix.
+        self.assertEqual(_resolve_tool_weight("Read:py", cfg), 0.1)
+        self.assertEqual(_resolve_tool_weight("Read:tex", cfg), 0.1)
+        # Bare name → bare entry.
+        self.assertEqual(_resolve_tool_weight("Read", cfg), 0.1)
+        self.assertEqual(_resolve_tool_weight("Bash", cfg), 0.1)
+        # Tool not mentioned → tool_default.
+        self.assertEqual(_resolve_tool_weight("memory_search", cfg), 0.5)
+        self.assertEqual(_resolve_tool_weight("anything:weird", cfg), 0.5)
+
+    def test_archive_tags_read_with_extension(self) -> None:
+        """End-to-end: archive an assistant+tool_result pair where the
+        Read targets a markdown file, verify the stored row has
+        ``name='Read:md'`` and that subsequent picker calls weight it
+        at the document tier."""
+        import tempfile, shutil
+        from unittest.mock import patch
+        from plugins.autobio.engine import AutobioContextEngine
+
+        tmp = tempfile.mkdtemp(prefix="autobio_tne_")
+        try:
+            eng = AutobioContextEngine()
+            eng.update_model(model="t", context_length=100_000)
+            eng.on_session_start("tne", hermes_home=tmp)
+            eng.cfg["compression"]["speculative"] = False
+            if eng._speculative is not None:
+                eng._speculative._enabled = False
+
+            messages: List[Dict[str, Any]] = [
+                {"role": "user", "content": "read the spec"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {
+                        "name": "Read",
+                        "arguments": '{"file_path": "/repo/docs/spec.md"}',
+                    }},
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "name": "Read",
+                 "content": "# Hierarchical Memory\n\nThis is the spec...\n"},
+                {"role": "assistant", "content": "got it"},
+                # And a code read for comparison.
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c2", "type": "function", "function": {
+                        "name": "Read",
+                        "arguments": '{"file_path": "/repo/src/main.py"}',
+                    }},
+                ]},
+                {"role": "tool", "tool_call_id": "c2", "name": "Read",
+                 "content": "import sys\nprint('hi')\n"},
+            ]
+            eng._archive_live(messages)
+
+            import sqlite3
+            conn = sqlite3.connect(f"{tmp}/memory/autobio/store.db")
+            conn.row_factory = sqlite3.Row
+            tool_rows = conn.execute(
+                "SELECT tool_name, tool_call_id FROM messages "
+                "WHERE session_id='tne' AND role='tool' "
+                "ORDER BY position",
+            ).fetchall()
+            self.assertEqual(len(tool_rows), 2)
+            names = {r["tool_call_id"]: r["tool_name"] for r in tool_rows}
+            self.assertEqual(names["c1"], "Read:md")
+            self.assertEqual(names["c2"], "Read:py")
+
+            # Picker weight check: the Read:md row should weigh at 0.5,
+            # Read:py at 0.1, under the production weights.
+            from plugins.autobio.compression import _weighted_msg_tokens
+            from plugins.autobio.config import load_autobio_config
+            weights = load_autobio_config()["compression"]["weights"]
+            doc_msg = {"role": "tool", "name": "Read:md", "content": "X" * 1000}
+            code_msg = {"role": "tool", "name": "Read:py", "content": "X" * 1000}
+            doc_w = _weighted_msg_tokens(doc_msg, weights)
+            code_w = _weighted_msg_tokens(code_msg, weights)
+            self.assertGreater(
+                doc_w / max(1.0, code_w), 4.0,
+                f"Read:md should weight at least 4x more than Read:py "
+                f"(got doc={doc_w} code={code_w})",
+            )
+
+            eng.on_session_end("tne", [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ChunkAlignment(unittest.TestCase):
+    """Picker must produce a usable chunk even when the first
+    uncovered message is an oversized assistant + tool_calls."""
+
+    def test_oversized_first_message_extends_forward(self) -> None:
+        """A chunk that starts with a single assistant message whose
+        tool_call arguments alone exceed ``chunk_token_target`` must
+        not be discarded by alignment. The picker should extend the
+        chunk forward through matching tool_results.
+
+        Regression: the previous backward-align cut such chunks back
+        to zero ('chunk ends with assistant+tool_calls' triggered the
+        cut even when the message was the first and only one), so the
+        picker returned no chunk and compression silently stopped.
+        """
+        import tempfile, shutil
+        from plugins.autobio.compression import _pick_archive_chunk
+        from plugins.autobio.ids import message_hash
+        from plugins.autobio.store import close_store, get_store
+
+        tmp = tempfile.mkdtemp(prefix="autobio_align_")
+        try:
+            store = get_store(tmp, "align")
+
+            # An assistant whose tool_call arguments alone are ~7k
+            # tokens (above chunk_token_target=6000). Followed by a
+            # matching tool result with normal content.
+            big_args = '{"command": "' + "x" * 28_000 + '"}'
+            asst = {
+                "role": "assistant", "content": "",
+                "tool_calls": [{
+                    "id": "c-big", "type": "function",
+                    "function": {"name": "Bash", "arguments": big_args},
+                }],
+            }
+            tool = {
+                "role": "tool", "tool_call_id": "c-big", "name": "Bash",
+                "content": "ok\n",
+            }
+            # Pad the tail with normal messages so the picker has
+            # enough room to pick (else protect_last reservation
+            # makes everything ineligible).
+            extras = []
+            for i in range(80):
+                extras.append({"role": "user", "content": f"u{i} " + "y"*200})
+                extras.append({"role": "assistant", "content": f"a{i} " + "z"*200})
+
+            messages = [asst, tool] + extras
+            for i, m in enumerate(messages):
+                store.upsert_message(message_hash(m), m, turn=i, position=i)
+
+            chunk_hashes, _ = _pick_archive_chunk(
+                store,
+                chunk_token_target=6000,
+                # 0 reserve so we focus on the alignment bug, not on
+                # tail-budget edge cases.
+                protect_last_tokens=0,
+                protect_first_n=0,
+                weights_cfg={"default": 1.0, "tool_default": 1.0,
+                             "tool_by_name": {"Bash": 1.0}},
+            )
+            self.assertGreater(
+                len(chunk_hashes), 0,
+                "picker should not return empty when chunk starts "
+                "with an oversized assistant+tool_calls",
+            )
+            # The chunk must contain the matching tool message —
+            # extending forward is the whole point.
+            self.assertEqual(
+                chunk_hashes[0], message_hash(asst),
+                "chunk should start with the oversized assistant",
+            )
+            self.assertEqual(
+                chunk_hashes[1], message_hash(tool),
+                "chunk should include the matching tool result",
+            )
+
+            store.close()
+            close_store(tmp, "align")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

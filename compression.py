@@ -852,35 +852,79 @@ def _emit_archive_run(
         if cum >= chunk_token_target:
             break
 
-    chunk_msgs = [m for _, _, m, _ in usable[:cut]]
-    aligned = _align_chunk_msgs_backward(chunk_msgs)
+    # Forward-align: if the chunk has pending tool_calls (assistant
+    # tool_calls without matching tool_results inside the chunk),
+    # extend the cut forward to include the tool_results. Without
+    # this, an assistant whose args alone exceed chunk_token_target
+    # produces a single-message chunk with dangling calls — and the
+    # subsequent ``_coerce_well_formed`` step drops the dangling
+    # call, losing the conversational link.
+    aligned = _align_chunk_msgs_forward(usable, cut)
     if aligned <= 0:
         return None
 
     return [r["hash"] for _, r, _, _ in usable[:aligned]]
 
 
-def _align_chunk_msgs_backward(msgs: List[Dict[str, Any]]) -> int:
-    """Return the largest end index ``e <= len(msgs)`` such that
-    ``msgs[:e]`` does not split an assistant + tool_results group.
+def _align_chunk_msgs_forward(
+    usable: List[Tuple[int, Dict[str, Any], Dict[str, Any], float]],
+    cut: int,
+) -> int:
+    """Extend ``cut`` forward through ``usable`` to satisfy any tool
+    calls inside the chunk that don't yet have their tool_results.
 
-    A trailing run of ``role == "tool"`` followed by an assistant with
-    ``tool_calls`` means we'd be cutting between the assistant and its
-    results. Pull back before the assistant.
+    Algorithm:
+      1. Walk ``usable[:cut]`` once, tracking pending tool_call_ids
+         (added when an assistant's tool_calls land, removed when a
+         matching tool result lands).
+      2. While pending is non-empty and there are more elements in
+         ``usable``: if the next element is a tool message, include
+         it (and clear its id from pending if matching); if it's
+         non-tool, stop — the conversation moved on without
+         resolving, which is an orphan we can't fix here.
+      3. Return the (possibly larger) ``cut``.
+
+    This replaces the older backward-cut alignment, which had a
+    pathological case: a single assistant whose tool_calls'
+    arguments alone exceeded ``chunk_token_target`` would hit the
+    target on its own, then backward-cut would shrink the chunk to
+    zero (because "the only msg is asst+tool_calls").
     """
-    end = len(msgs)
-    if end <= 0:
-        return end
-    check = end - 1
-    while check >= 0 and msgs[check].get("role") == "tool":
-        check -= 1
-    if (
-        check >= 0
-        and msgs[check].get("role") == "assistant"
-        and msgs[check].get("tool_calls")
-    ):
-        end = check
-    return end
+    if cut <= 0:
+        return cut
+    pending: set = set()
+    for _, _, m, _ in usable[:cut]:
+        role = m.get("role")
+        if role == "assistant":
+            for tc in m.get("tool_calls") or []:
+                cid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
+                if cid:
+                    pending.add(cid)
+        elif role == "tool":
+            cid = m.get("tool_call_id")
+            if cid in pending:
+                pending.discard(cid)
+    if not pending:
+        return cut
+
+    j = cut
+    n = len(usable)
+    while pending and j < n:
+        m = usable[j][2]
+        role = m.get("role")
+        if role == "tool":
+            cid = m.get("tool_call_id")
+            if cid in pending:
+                pending.discard(cid)
+            j += 1
+            continue
+        # Hit a non-tool while we still have pending calls. The
+        # transcript itself has the orphan (no result for those
+        # tool_calls in the original conversation). Stop here;
+        # ``_coerce_well_formed`` in the summarizer prompt builder
+        # drops unpaired tool_calls so the LLM call stays valid.
+        break
+    return j
 
 
 def _all_messages_ordered(store: Store) -> List[Dict[str, Any]]:
@@ -1764,6 +1808,13 @@ def _weighted_msg_tokens(
     "user explored module X". User and assistant text gets full weight
     because it only exists in the conversation.
 
+    Tool name lookup is **hierarchical**: an ext-suffixed tool name
+    (``Read:md``, set at archive time by ``tool_naming.enrich_tool_name``)
+    is checked first; if not found, the bare prefix (``Read``) is
+    checked; finally the ``tool_default`` falls back. This lets the
+    weights config override per-extension (``Read:md: 0.5`` for
+    documents) while keeping the bare ``Read: 0.1`` default for code.
+
     With ``weights_cfg=None``, this is identical to ``_msg_tokens``.
     Production sets weights via config; tests can pass an explicit
     dict.
@@ -1773,16 +1824,36 @@ def _weighted_msg_tokens(
         return float(raw)
     role = msg.get("role", "")
     if role == "tool":
-        name = msg.get("name") or ""
-        by_name = weights_cfg.get("tool_by_name") or {}
-        weight = by_name.get(
-            name, weights_cfg.get("tool_default", 0.5),
-        )
+        weight = _resolve_tool_weight(msg.get("name") or "", weights_cfg)
     else:
         weight = weights_cfg.get(
             role, weights_cfg.get("default", 1.0),
         )
     return float(raw) * float(weight)
+
+
+def _resolve_tool_weight(
+    name: str, weights_cfg: Dict[str, Any],
+) -> float:
+    """Resolve a tool's per-message weight with ext-suffix fallback.
+
+    Lookup order:
+      1. ``tool_by_name[name]`` — exact match on the (possibly
+         ext-suffixed) name. E.g., ``Read:md`` overrides documents.
+      2. ``tool_by_name[prefix]`` where prefix is everything before
+         the first colon. E.g., a ``Read:tex`` we don't have a
+         specific entry for falls back to plain ``Read``.
+      3. ``tool_default`` — the umbrella default for tools the
+         config doesn't mention at all.
+    """
+    by_name = weights_cfg.get("tool_by_name") or {}
+    if name in by_name:
+        return float(by_name[name])
+    if ":" in name:
+        prefix = name.split(":", 1)[0]
+        if prefix in by_name:
+            return float(by_name[prefix])
+    return float(weights_cfg.get("tool_default", 0.5))
 
 
 def _coerce_str(v: Any) -> Optional[str]:

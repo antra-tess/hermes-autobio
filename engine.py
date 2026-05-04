@@ -270,6 +270,9 @@ class AutobioContextEngine(ContextEngine):
         - Skip markers (recognized by content prefix + verified
           against the set of hashes a fresh render would produce
           for currently-active summaries).
+        - Enrich tool results with extension-suffixed tool names
+          (see ``tool_naming.enrich_tool_name``) so weights resolve
+          ``Read:md`` distinctly from ``Read:py``.
         - Hash and archive everything else, preserving monotonic
           positions.
 
@@ -278,6 +281,9 @@ class AutobioContextEngine(ContextEngine):
         """
         if not self._store:
             return
+        from .tool_naming import build_tool_args_index, enrich_tool_name
+        args_index = build_tool_args_index(messages)
+
         marker_hashes = known_marker_hashes(self._store)
         next_pos = self._next_position()
         current_turn = self._current_turn()
@@ -285,7 +291,8 @@ class AutobioContextEngine(ContextEngine):
             try:
                 if is_marker_message(msg):
                     continue
-                h = message_hash(msg)
+                enriched = enrich_tool_name(msg, args_index)
+                h = message_hash(enriched)
                 if h in marker_hashes:
                     continue   # belt-and-braces: matches an active marker
                 # If already archived, upsert is a no-op via INSERT OR
@@ -293,7 +300,7 @@ class AutobioContextEngine(ContextEngine):
                 # insert; if the row exists it keeps its original.
                 if self._store.get_message(h) is None:
                     self._store.upsert_message(
-                        h, msg, turn=current_turn, position=next_pos,
+                        h, enriched, turn=current_turn, position=next_pos,
                     )
                     next_pos += 1
             except Exception as e:
@@ -530,6 +537,12 @@ class AutobioContextEngine(ContextEngine):
         producing the recursive Torment Nexus the projection model
         was designed to prevent.
 
+        Tool results are enriched with their resolved tool name (and
+        for ``Read``-family tools, a ``:ext`` suffix derived from the
+        file path) BEFORE hashing, so the picker's per-tool weight
+        lookup can distinguish ``Read:md`` (a document — full weight)
+        from ``Read:py`` (source code — discounted).
+
         Uses monotonic positions seeded from MAX(position) so positions
         survive renders. After archival, tool results over the
         configured threshold are auto-marked as documents.
@@ -538,6 +551,13 @@ class AutobioContextEngine(ContextEngine):
         """
         if not self._store:
             return 0
+        from .tool_naming import build_tool_args_index, enrich_tool_name
+
+        # Build the tool_call_id → {name, args} map from any assistant
+        # tool_calls in the current view. Used to suffix Read tool
+        # results with the file extension at archive time.
+        args_index = build_tool_args_index(messages)
+
         marker_hashes = known_marker_hashes(self._store)
         next_pos = self._next_position()
         current_turn = self._current_turn()
@@ -546,16 +566,20 @@ class AutobioContextEngine(ContextEngine):
             try:
                 if is_marker_message(msg):
                     continue
-                h = message_hash(msg)
+                # Enrich tool results with extension-suffixed name so
+                # the hash and the stored row agree (and so the picker
+                # weight lookup picks up Read:md vs Read:py).
+                enriched = enrich_tool_name(msg, args_index)
+                h = message_hash(enriched)
                 if h in marker_hashes:
                     continue   # belt-and-braces
                 if self._store.get_message(h) is not None:
                     continue   # already archived
                 self._store.upsert_message(
-                    h, msg, turn=current_turn, position=next_pos,
+                    h, enriched, turn=current_turn, position=next_pos,
                 )
                 next_pos += 1
-                self._maybe_auto_mark_document(h, msg)
+                self._maybe_auto_mark_document(h, enriched)
             except Exception as e:
                 logger.error(
                     "autobio: archive FAILED (turn %s): %s",
@@ -589,7 +613,13 @@ class AutobioContextEngine(ContextEngine):
         if est_tokens < threshold:
             return
 
-        tool_name = msg.get("name") or ""
+        # The stored ``name`` may carry an ext suffix from
+        # ``tool_naming.enrich_tool_name`` (e.g., ``read_file:log``).
+        # For "what tool produced this document?" semantics — exclude
+        # checks, title text, meta — we want the bare tool name.
+        # The suffix is purely a picker hint, not tool identity.
+        stored_name = msg.get("name") or ""
+        tool_name = stored_name.split(":", 1)[0] if ":" in stored_name else stored_name
         exclude = doc_cfg.get("exclude_tools") or []
         if tool_name and tool_name in exclude:
             return

@@ -171,7 +171,16 @@ class ClaudeCodeAdapter(TranscriptAdapter):
             elif btype == "tool_result":
                 tu_id = blk.get("tool_use_id") or ""
                 tu = pending_tools.pop(tu_id, None)
-                tool_name = (tu or {}).get("name") or "unknown"
+                raw_tool_name = (tu or {}).get("name") or "unknown"
+                # Extension-tag Read-family tool results so the picker's
+                # weight lookup distinguishes ``Read:md`` (a document —
+                # full weight) from ``Read:py`` (source — discounted).
+                # ``synthesize_tool_name`` is a no-op for tools that
+                # aren't in the Read family.
+                from ..tool_naming import synthesize_tool_name
+                tool_name = synthesize_tool_name(
+                    raw_tool_name, (tu or {}).get("input"),
+                )
                 if tu is None:
                     # Orphan result — no matching tool_use was emitted
                     # earlier (truncated or malformed transcript).
