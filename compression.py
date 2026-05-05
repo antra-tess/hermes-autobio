@@ -587,8 +587,22 @@ def compress_step_archive(
     chunk_msgs = _materialize_chunk(store, chunk_hashes)
     chunk_tokens = estimate_messages_tokens_rough(chunk_msgs)
 
+    # Head: any uncovered messages with position < the chunk's first
+    # position. These are content the agent saw at the as-of moment
+    # but that hasn't been folded into any summary yet — typically
+    # the protect_first_n system messages and any pinned raw content
+    # (or rollback-uncovered debris). Per spec: the summarizer
+    # prompt's [head — messages before the chunk] segment. Without
+    # this, the summarizer forms memories of late conversation
+    # without ever having seen the conversation's opening user turn,
+    # any pinned reference material, etc.
+    head_msgs = _materialize_head(store, chunk_hashes[0])
+    all_msgs = head_msgs + chunk_msgs
+    chunk_start_idx = len(head_msgs)
+    chunk_end_idx = len(all_msgs)
+
     summary_id = summarize_chunk(
-        chunk_msgs, 0, len(chunk_msgs), store, cfg, model_info,
+        all_msgs, chunk_start_idx, chunk_end_idx, store, cfg, model_info,
         doc_context=doc_context,
     )
     if summary_id is None:
@@ -619,6 +633,38 @@ def _materialize_chunk(
     order. Used to feed the summarizer prompt builder."""
     rows = store.get_messages_by_hashes(chunk_hashes)
     return [_archive_row_to_msg(r) for r in rows]
+
+
+def _materialize_head(
+    store: Store, chunk_first_hash: str,
+) -> List[Dict[str, Any]]:
+    """Return all uncovered messages with archive position strictly
+    before ``chunk_first_hash``'s position, in chronological order.
+
+    These are messages the agent saw at the as-of moment but that
+    haven't been folded into any summary — protect_first_n system
+    messages, pinned raw content, rollback-uncovered debris.
+    Surfaced as the spec's [head — messages before the chunk]
+    segment in the summarizer prompt.
+
+    Returns an empty list when the archive is in clean chronological
+    state with no protected/uncovered head content.
+    """
+    chunk_first_row = store.get_message(chunk_first_hash)
+    if chunk_first_row is None:
+        return []
+    chunk_first_pos = chunk_first_row.get("position")
+    if chunk_first_pos is None:
+        return []
+    with store._lock:
+        rows = store._conn.execute(
+            "SELECT * FROM messages "
+            "WHERE session_id = ? AND compressed_into IS NULL "
+            "AND position < ? "
+            "ORDER BY position ASC, turn ASC",
+            (store.session_id, int(chunk_first_pos)),
+        ).fetchall()
+    return [_archive_row_to_msg(dict(r)) for r in rows]
 
 
 def _retire_or_advance_doc_pin(
@@ -1489,8 +1535,22 @@ def _build_kv_preserving_prompt(
     """
     prompt: List[Dict[str, Any]] = []
 
-    # Prior summaries, oldest level first. All predate the chunk because
-    # compression is strictly chronological.
+    # Prior memories, ordered by archive position (chronological).
+    #
+    # **Level balance — fill lower orbitals first.** L2/L3 are coarser
+    # consolidations of L1s; the L1s themselves still exist in the
+    # archive (with ``merged_into`` set, but never deleted). For the
+    # summarizer prompt — which has its own auxiliary-model context
+    # budget — we always expand to L1 fidelity. The L2/L3 markers
+    # exist for the live view's compactness, not for the summarizer.
+    # By showing the L1 bodies directly we give the summarizer
+    # "first-hand memory, high fidelity" context for every prior
+    # region, matching the spec's adaptive-resolution principle.
+    #
+    # Compression and prompt construction are separate concerns:
+    # compression runs as soon as a chunk is foldable (creating the
+    # archive's level structure), but every prompt rebalances against
+    # the available L1s regardless of how that structure looks.
     #
     # Each memory is narrativized as a two-turn dialogue: CM asks the
     # agent to recall a specific memory (user role), and the agent
@@ -1500,27 +1560,22 @@ def _build_kv_preserving_prompt(
     #   - Bodies are the agent's autobiographical recall — putting
     #     them under user role would tell the model "the user told me
     #     X happened" rather than "I remember X."
-    #   - Headers ("MEMORY L1-..."  / "Recall L1-...") are NOT
-    #     produced by the LLM — they're system labels. Putting them
+    #   - Headers ("[CM] Recall memory L1-...") are NOT produced by
+    #     the LLM — they're CM-voiced system labels. Putting them
     #     under assistant role would falsely attribute synthetic
     #     metadata to the agent.
-    #
-    # Splitting header into a CM-voiced user turn + body into an
-    # assistant turn satisfies both: the dialogue reads naturally,
-    # KV state attributes each speaker honestly.
-    for level in (3, 2, 1):
-        for s in store.list_summaries(level, include_merged=False):
-            prompt.append({
-                "role": "user",
-                "content": (
-                    f"[CM] Recall memory {s['id']} "
-                    f"(gen {s['compression_generations']})."
-                ),
-            })
-            prompt.append({
-                "role": "assistant",
-                "content": s["content"],
-            })
+    for s in _enumerate_l1s_for_prompt(store):
+        prompt.append({
+            "role": "user",
+            "content": (
+                f"[CM] Recall memory {s['id']} "
+                f"(gen {s['compression_generations']})."
+            ),
+        })
+        prompt.append({
+            "role": "assistant",
+            "content": s["content"],
+        })
 
     # Head only — everything before the chunk. No tail_after_chunk.
     head = messages[:chunk_start]
@@ -1888,6 +1943,33 @@ def _resolve_tool_weight(
         if prefix in by_name:
             return float(by_name[prefix])
     return float(weights_cfg.get("tool_default", 0.5))
+
+
+def _enumerate_l1s_for_prompt(store: Store) -> List[Dict[str, Any]]:
+    """Return all L1 summaries for this session, ordered by the
+    archive position of their earliest source message.
+
+    Includes both active and merged L1s — the merged ones are the
+    constituents of any L2/L3 consolidations, and we surface them
+    directly rather than the consolidations because the summarizer's
+    auxiliary context can afford the higher fidelity. (Spec
+    "adaptive resolution" / "fill lower orbitals first" rule.)
+
+    L1s with unresolvable position ranges (orphan source_hashes)
+    sort to the end — they still appear in the prompt but their
+    placement among ordered memories is arbitrary.
+    """
+    all_l1s = store.list_summaries(level=1, include_merged=True)
+    sortable: List[Tuple[int, Dict[str, Any]]] = []
+    unresolved: List[Dict[str, Any]] = []
+    for s in all_l1s:
+        pos_min, _ = store.get_summary_position_range(s["id"])
+        if pos_min is None:
+            unresolved.append(s)
+        else:
+            sortable.append((int(pos_min), s))
+    sortable.sort(key=lambda t: t[0])
+    return [s for _, s in sortable] + unresolved
 
 
 def _coerce_str(v: Any) -> Optional[str]:

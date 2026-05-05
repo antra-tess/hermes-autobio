@@ -829,5 +829,525 @@ class AgentOriginRoleHonesty(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class SummarizerPromptComposition(unittest.TestCase):
+    """End-to-end composition of the summarizer prompt against a
+    synthetic archive. Drives ``compress_step_archive`` with a mocked
+    LLM and inspects the captured prompt structure to verify spec
+    compliance:
+
+    - Prior memories appear in archive-position order.
+    - L2/L3 consolidations are EXPANDED to their constituent L1s in
+      the prompt (the "fill lower orbitals first" / adaptive-
+      resolution rule).
+    - The ``[head — messages before the chunk]`` segment includes
+      uncovered messages with position < the chunk's first position
+      (protect_first_n head, pinned raw content, rollback debris).
+    - The marker, chunk, and instruction follow in that order.
+    - No content past the chunk leaks in (no tail_after_chunk).
+    """
+
+    def setUp(self) -> None:
+        import agent.auxiliary_client  # noqa: F401
+        self.tmp = tempfile.mkdtemp(prefix="autobio_compose_")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _build_archive_with_covered_l1(
+        self, store, n_covered_msgs: int, n_uncovered_msgs: int,
+    ) -> "tuple[list[str], list[str]]":
+        """Insert ``n_covered_msgs`` followed by ``n_uncovered_msgs``
+        messages and mark the first batch as covered by a synthetic
+        L1. Returns (covered_hashes, uncovered_hashes)."""
+        from plugins.autobio.ids import message_hash
+        covered_hashes: List[str] = []
+        uncovered_hashes: List[str] = []
+        pos = 0
+        for i in range(n_covered_msgs):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role, "content": f"PASTBATCH_{i} " + ("x" * 200)}
+            h = message_hash(m)
+            store.upsert_message(h, m, turn=i, position=pos)
+            covered_hashes.append(h)
+            pos += 1
+        l1_id = store.insert_summary(
+            level=1, source_hashes=covered_hashes,
+            source_hash="prior-batch-sh",
+            content=f"I recall the first {n_covered_msgs} steps.",
+            tokens=150, compression_generations=1,
+        )
+        store.mark_compressed(covered_hashes, l1_id)
+        for i in range(n_uncovered_msgs):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role,
+                 "content": f"uncovered-{i} " + ("y" * 300)}
+            h = message_hash(m)
+            store.upsert_message(h, m, turn=n_covered_msgs + i, position=pos)
+            uncovered_hashes.append(h)
+            pos += 1
+        return covered_hashes, uncovered_hashes
+
+    def test_head_includes_uncovered_messages_before_chunk(self) -> None:
+        """A protect_first_n system message and any other uncovered
+        position-before-the-chunk content must appear in head."""
+        from plugins.autobio.compression import (
+            ModelInfo, compress_step_archive,
+        )
+        from plugins.autobio.ids import message_hash
+        from plugins.autobio.store import close_store, get_store
+
+        store = get_store(self.tmp, "head_test")
+        # System message at position 0 — uncovered, sits below all
+        # subsequent compression. This is the typical
+        # protect_first_n head.
+        sys_msg = {"role": "user", "content": "INITIAL_USER_TURN: please help me"}
+        sys_h = message_hash(sys_msg)
+        store.upsert_message(sys_h, sys_msg, turn=0, position=0)
+        # 30 messages of conversation, weighted enough that the
+        # picker picks one chunk from positions 1..N (note the
+        # picker has protect_first_n=1 by default).
+        for i in range(1, 31):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role,
+                 "content": f"conv-{i} " + ("z" * 400)}
+            store.upsert_message(message_hash(m), m, turn=i, position=i)
+
+        captured = []
+        def capture(**kw):
+            captured.append(kw.get("messages") or [])
+            r = MagicMock()
+            r.choices = [MagicMock()]
+            r.choices[0].message.content = "I summarized the chunk."
+            return r
+
+        cfg = {
+            "compression": {
+                "chunk_tokens": 1_000,
+                "summary_target_tokens": 200,
+                "speculative": False,
+                # Default weights — full weight for user/assistant.
+            },
+            "documents": {"eligibility": "size_pressure"},
+        }
+        with patch("agent.auxiliary_client.call_llm", side_effect=capture):
+            compress_step_archive(
+                store, cfg, ModelInfo(model="t"),
+                protect_first_n=1, protect_last_tokens=500,
+            )
+
+        self.assertEqual(len(captured), 1, "expected one summarizer call")
+        prompt = captured[0]
+        # The system message body (INITIAL_USER_TURN: …) must appear
+        # somewhere in the prompt — that's head.
+        joined = "\n".join(
+            (m.get("content") or "") if isinstance(m.get("content"), str) else ""
+            for m in prompt
+        )
+        self.assertIn(
+            "INITIAL_USER_TURN", joined,
+            "head segment missing — first user message not in prompt",
+        )
+        store.close()
+        close_store(self.tmp, "head_test")
+
+    def test_head_empty_when_archive_is_clean(self) -> None:
+        """If every message at position < chunk_first is covered by
+        a summary, head is empty (no spurious entries)."""
+        from plugins.autobio.compression import (
+            ModelInfo, compress_step_archive,
+        )
+        from plugins.autobio.store import close_store, get_store
+
+        store = get_store(self.tmp, "clean_head")
+        self._build_archive_with_covered_l1(
+            store, n_covered_msgs=10, n_uncovered_msgs=20,
+        )
+
+        captured = []
+        def capture(**kw):
+            captured.append(kw.get("messages") or [])
+            r = MagicMock()
+            r.choices = [MagicMock()]
+            r.choices[0].message.content = "summary"
+            return r
+
+        cfg = {
+            "compression": {
+                "chunk_tokens": 1_000, "summary_target_tokens": 200,
+                "speculative": False,
+            },
+            "documents": {"eligibility": "size_pressure"},
+        }
+        with patch("agent.auxiliary_client.call_llm", side_effect=capture):
+            compress_step_archive(
+                store, cfg, ModelInfo(model="t"),
+                # protect_first_n=0 so the synthetic position-0
+                # message is foldable along with the rest.
+                protect_first_n=0, protect_last_tokens=500,
+            )
+
+        prompt = captured[0]
+        # No "PASTBATCH_" raw content should appear in the prompt —
+        # those messages are already represented by the L1 recall pair.
+        for m in prompt:
+            content = m.get("content") or ""
+            if isinstance(content, str):
+                self.assertNotIn(
+                    "PASTBATCH_", content,
+                    f"covered message leaked into prompt as raw: {m}",
+                )
+        store.close()
+        close_store(self.tmp, "clean_head")
+
+    def test_l2_consolidation_expanded_to_l1s_in_prompt(self) -> None:
+        """When the archive has an L2 consolidating 6 L1s, the
+        summarizer prompt must show all 6 L1s (lowest orbital first)
+        rather than just the L2 marker. Spec: 'adaptive resolution',
+        L1 = 'first-hand memory, high fidelity'."""
+        from plugins.autobio.compression import (
+            ModelInfo, _enumerate_l1s_for_prompt, compress_step_archive,
+        )
+        from plugins.autobio.ids import message_hash
+        from plugins.autobio.store import close_store, get_store
+
+        store = get_store(self.tmp, "l2_balance")
+
+        # Build an archive: 18 messages, with positions 0..17.
+        for i in range(18):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role, "content": f"m{i}-{'x'*30}"}
+            store.upsert_message(message_hash(m), m, turn=i, position=i)
+
+        # Manually create 3 L1s, each covering 6 messages, and merge
+        # them into a single L2.
+        l1_ids = []
+        for k in range(3):
+            hs = []
+            for j in range(6):
+                pos = k * 6 + j
+                role = "user" if pos % 2 == 0 else "assistant"
+                hs.append(message_hash({"role": role, "content": f"m{pos}-{'x'*30}"}))
+            sid = store.insert_summary(
+                level=1, source_hashes=hs, source_hash=f"sh-{k}",
+                content=f"I remember chunk {k}: detail-{k}-alpha-beta",
+                tokens=80, compression_generations=1,
+            )
+            store.mark_compressed(hs, sid)
+            l1_ids.append(sid)
+
+        l2_id = store.insert_summary(
+            level=2, source_hashes=l1_ids, source_hash="l2-sh",
+            content="Consolidated overview across 3 chunks.",
+            tokens=120, compression_generations=2,
+        )
+        store.mark_summary_merged(l1_ids, l2_id)
+
+        # Sanity: list_summaries(level=1, include_merged=False) is now
+        # empty (all L1s merged into L2). list_summaries(level=2) has L2.
+        self.assertEqual(
+            len(store.list_summaries(1, include_merged=False)), 0,
+        )
+        self.assertEqual(
+            len(store.list_summaries(2, include_merged=False)), 1,
+        )
+
+        # The prompt-enumeration helper must surface all 3 L1s
+        # (despite them being merged) — that's the balance rule.
+        l1s = _enumerate_l1s_for_prompt(store)
+        self.assertEqual(
+            len(l1s), 3,
+            f"prompt should expand L2 to 3 L1s; got {[s['id'] for s in l1s]}",
+        )
+
+        # Drive a compress to see the actual prompt structure.
+        # We need uncovered messages to form a new chunk; archive's
+        # 18 messages are all covered. Add 30 more uncovered.
+        for i in range(18, 48):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role, "content": f"newm{i}-{'y'*200}"}
+            store.upsert_message(message_hash(m), m, turn=i, position=i)
+
+        captured = []
+        def capture(**kw):
+            captured.append(kw.get("messages") or [])
+            r = MagicMock()
+            r.choices = [MagicMock()]
+            r.choices[0].message.content = "new memory"
+            return r
+
+        cfg = {
+            "compression": {
+                "chunk_tokens": 1_000, "summary_target_tokens": 200,
+                "speculative": False,
+            },
+            "documents": {"eligibility": "size_pressure"},
+        }
+        with patch("agent.auxiliary_client.call_llm", side_effect=capture):
+            compress_step_archive(
+                store, cfg, ModelInfo(model="t"),
+                protect_first_n=0, protect_last_tokens=500,
+            )
+
+        self.assertEqual(len(captured), 1)
+        prompt = captured[0]
+
+        # Collect "Recall memory ..." headers — must be 3 L1s, NOT L2.
+        recall_headers = [
+            m for m in prompt
+            if isinstance(m.get("content"), str)
+            and "Recall memory" in m["content"]
+        ]
+        self.assertEqual(
+            len(recall_headers), 3,
+            f"expected 3 L1 recall headers, got {len(recall_headers)}: "
+            f"{[m['content'] for m in recall_headers]}",
+        )
+        for h in recall_headers:
+            self.assertIn("L1-", h["content"])
+            self.assertNotIn(
+                "L2-", h["content"],
+                f"L2 leaked into prompt — should be expanded to L1s: {h}",
+            )
+        store.close()
+        close_store(self.tmp, "l2_balance")
+
+    def test_memories_ordered_by_position_in_prompt(self) -> None:
+        """L1s appear in archive-position order, regardless of
+        creation order or merge state."""
+        from plugins.autobio.compression import _enumerate_l1s_for_prompt
+        from plugins.autobio.ids import message_hash
+        from plugins.autobio.store import close_store, get_store
+
+        store = get_store(self.tmp, "order")
+        # Insert messages at positions 0..29.
+        for i in range(30):
+            m = {"role": "user", "content": f"m{i}"}
+            store.upsert_message(message_hash(m), m, turn=i, position=i)
+
+        # Create 3 L1s in REVERSE order (cover late messages first).
+        # List position order should still come out correct.
+        l1c_hashes = [message_hash({"role": "user", "content": f"m{i}"})
+                      for i in range(20, 30)]
+        l1c = store.insert_summary(
+            level=1, source_hashes=l1c_hashes, source_hash="shc",
+            content="late",
+            tokens=50, compression_generations=1,
+        )
+        store.mark_compressed(l1c_hashes, l1c)
+
+        l1a_hashes = [message_hash({"role": "user", "content": f"m{i}"})
+                      for i in range(0, 10)]
+        l1a = store.insert_summary(
+            level=1, source_hashes=l1a_hashes, source_hash="sha",
+            content="early",
+            tokens=50, compression_generations=1,
+        )
+        store.mark_compressed(l1a_hashes, l1a)
+
+        l1b_hashes = [message_hash({"role": "user", "content": f"m{i}"})
+                      for i in range(10, 20)]
+        l1b = store.insert_summary(
+            level=1, source_hashes=l1b_hashes, source_hash="shb",
+            content="mid",
+            tokens=50, compression_generations=1,
+        )
+        store.mark_compressed(l1b_hashes, l1b)
+
+        # Enumerate — must come back ordered early, mid, late by
+        # source position, NOT creation order (which was c, a, b).
+        l1s = _enumerate_l1s_for_prompt(store)
+        ids = [s["id"] for s in l1s]
+        self.assertEqual(
+            ids, [l1a, l1b, l1c],
+            f"L1s should be in position order [early, mid, late], got {ids}",
+        )
+        store.close()
+        close_store(self.tmp, "order")
+
+    def test_no_tail_after_chunk_in_prompt(self) -> None:
+        """Spec: nothing AFTER the chunk leaks into the summarizer
+        prompt — that would be future information from the chunk's
+        as-of perspective."""
+        from plugins.autobio.compression import (
+            ModelInfo, compress_step_archive,
+        )
+        from plugins.autobio.ids import message_hash
+        from plugins.autobio.store import close_store, get_store
+
+        store = get_store(self.tmp, "no_tail")
+        # 60 messages, none covered. Chunk picker will fold a slice
+        # from the start; the rest stays as live tail. Tail must NOT
+        # appear in the prompt.
+        # First half: foldable content with weighted tokens enough
+        # to reach the chunk_target. Second half: clearly-marked
+        # FUTURE_TAIL_* content with similar weight (so the tail
+        # reservation is satisfied AND the picker has room to emit a
+        # chunk from the front).
+        for i in range(60):
+            role = "user" if i % 2 == 0 else "assistant"
+            content = (f"FUTURE_TAIL_{i} " + ("z" * 600) if i >= 30
+                       else f"chunk-{i} " + ("z" * 600))
+            m = {"role": role, "content": content}
+            store.upsert_message(message_hash(m), m, turn=i, position=i)
+
+        captured = []
+        def capture(**kw):
+            captured.append(kw.get("messages") or [])
+            r = MagicMock()
+            r.choices = [MagicMock()]
+            r.choices[0].message.content = "summary"
+            return r
+
+        cfg = {
+            "compression": {
+                "chunk_tokens": 1_000, "summary_target_tokens": 200,
+                "speculative": False,
+            },
+            "documents": {"eligibility": "size_pressure"},
+        }
+        with patch("agent.auxiliary_client.call_llm", side_effect=capture):
+            compress_step_archive(
+                store, cfg, ModelInfo(model="t"),
+                protect_first_n=0, protect_last_tokens=2_000,
+            )
+        self.assertEqual(len(captured), 1)
+        prompt = captured[0]
+
+        # No "FUTURE_TAIL_*" content must appear anywhere in the
+        # prompt — that's content past the chunk.
+        for m in prompt:
+            content = m.get("content") or ""
+            if isinstance(content, str):
+                self.assertNotIn(
+                    "FUTURE_TAIL_", content,
+                    f"post-chunk content leaked into prompt: {content[:80]!r}",
+                )
+        store.close()
+        close_store(self.tmp, "no_tail")
+
+    def test_full_prompt_structure(self) -> None:
+        """End-to-end skeleton check: prompt is laid out as
+        [memory recall pairs] [head] [marker] [chunk] [instruction],
+        with no segments out of order.
+        """
+        from plugins.autobio.compression import (
+            ModelInfo, compress_step_archive, _MARKER,
+        )
+        from plugins.autobio.ids import message_hash
+        from plugins.autobio.store import close_store, get_store
+
+        store = get_store(self.tmp, "skeleton")
+        # System message at position 0 — head.
+        sys_msg = {"role": "user", "content": "HEAD_SYSTEM_MARKER_TEXT"}
+        store.upsert_message(message_hash(sys_msg), sys_msg, turn=0, position=0)
+
+        # Synthetic L1 covering positions 1..10 — prior memory.
+        l1_hashes = []
+        for i in range(1, 11):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role, "content": f"old-{i}"}
+            h = message_hash(m)
+            store.upsert_message(h, m, turn=i, position=i)
+            l1_hashes.append(h)
+        l1 = store.insert_summary(
+            level=1, source_hashes=l1_hashes, source_hash="prev",
+            content="PRIOR_MEMORY_BODY content here",
+            tokens=80, compression_generations=1,
+        )
+        store.mark_compressed(l1_hashes, l1)
+
+        # New uncovered conversation — chunk territory.
+        for i in range(11, 41):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role,
+                 "content": f"CHUNK_BODY_{i} " + ("z" * 400)}
+            store.upsert_message(message_hash(m), m, turn=i, position=i)
+
+        captured = []
+        def capture(**kw):
+            captured.append(kw.get("messages") or [])
+            r = MagicMock()
+            r.choices = [MagicMock()]
+            r.choices[0].message.content = "summary"
+            return r
+
+        cfg = {
+            "compression": {
+                "chunk_tokens": 1_000, "summary_target_tokens": 200,
+                "speculative": False,
+            },
+            "documents": {"eligibility": "size_pressure"},
+        }
+        with patch("agent.auxiliary_client.call_llm", side_effect=capture):
+            compress_step_archive(
+                store, cfg, ModelInfo(model="t"),
+                protect_first_n=1, protect_last_tokens=500,
+            )
+
+        prompt = captured[0]
+
+        # Locate each landmark by content.
+        idx_recall = next(
+            (i for i, m in enumerate(prompt)
+             if isinstance(m.get("content"), str)
+             and "Recall memory L1-" in m["content"]),
+            None,
+        )
+        idx_body = next(
+            (i for i, m in enumerate(prompt)
+             if isinstance(m.get("content"), str)
+             and "PRIOR_MEMORY_BODY" in m["content"]),
+            None,
+        )
+        idx_head = next(
+            (i for i, m in enumerate(prompt)
+             if isinstance(m.get("content"), str)
+             and "HEAD_SYSTEM_MARKER_TEXT" in m["content"]),
+            None,
+        )
+        idx_marker = next(
+            (i for i, m in enumerate(prompt)
+             if isinstance(m.get("content"), str)
+             and m["content"] == _MARKER),
+            None,
+        )
+        idx_chunk = next(
+            (i for i, m in enumerate(prompt)
+             if isinstance(m.get("content"), str)
+             and "CHUNK_BODY_" in m["content"]),
+            None,
+        )
+        idx_instr = next(
+            (i for i, m in enumerate(reversed(prompt))
+             if isinstance(m.get("content"), str)
+             and "Write the memory" in m["content"]),
+            None,
+        )
+        if idx_instr is not None:
+            idx_instr = len(prompt) - 1 - idx_instr
+
+        self.assertIsNotNone(idx_recall, "no recall header found")
+        self.assertIsNotNone(idx_body, "prior memory body missing")
+        self.assertIsNotNone(idx_head, "head missing")
+        self.assertIsNotNone(idx_marker, "marker missing")
+        self.assertIsNotNone(idx_chunk, "chunk content missing")
+        self.assertIsNotNone(idx_instr, "instruction missing")
+
+        # Skeleton order: recall_header < body < head < marker < chunk < instr
+        self.assertLess(idx_recall, idx_body,
+                        "recall header must precede its body")
+        self.assertLess(idx_body, idx_head,
+                        "memory body must precede head")
+        self.assertLess(idx_head, idx_marker,
+                        "head must precede marker")
+        self.assertLess(idx_marker, idx_chunk,
+                        "marker must precede chunk")
+        self.assertLess(idx_chunk, idx_instr,
+                        "chunk must precede instruction")
+
+        store.close()
+        close_store(self.tmp, "skeleton")
+
+
 if __name__ == "__main__":
     unittest.main()
