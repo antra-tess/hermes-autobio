@@ -17,7 +17,11 @@ Two entry points:
 CM operations (parsed out of CM's response by ``_execute_ops``):
   SEARCH <query>         → FTS5 hybrid search over summaries/messages
   GREP   <pattern>       → raw text grep across the archive on disk
-  UNCOMPRESS <summary_id>→ restore an L1/L2/L3's original content (or children)
+  UNCOMPRESS <summary_id>→ render this summary's source as raw in the
+                           live view; also inline the expansion in this
+                           op's result for the main instance to see now
+  REFOLD <summary_id>    → inverse of UNCOMPRESS: revert to showing the
+                           summary as a recall pair on subsequent renders
   PIN    <summary_id> <reason>  → mark a summary pinned
   UNPIN  <summary_id>    → remove pin
   SET_INTERVAL <N>       → change proactive check-in frequency
@@ -64,7 +68,13 @@ Available operations:
 
   SEARCH "query text"           — BM25 search over summaries + recent messages
   GREP "pattern"                — raw text search across summaries on disk
-  UNCOMPRESS L2-0003            — pull an L2/L3 back into its constituent L1s
+  UNCOMPRESS L1-0042            — render this summary's source as raw
+                                  messages in the live view (and inline
+                                  the expansion in this op's result for
+                                  the main instance to see now)
+  REFOLD L1-0042                — inverse of UNCOMPRESS: revert the live
+                                  view to showing this summary as a
+                                  recall pair instead of raw messages
   PIN L1-0014 "auth refactor"   — protect a summary from merging
   UNPIN L1-0014                 — remove pin
   MARK_DOCUMENT <start> <end> [style] [title]
@@ -641,10 +651,23 @@ def _dispatch_op(op: str, args: List[str], engine: "AutobioContextEngine") -> st
             return f"uncompress error: {e}"
         if not expanded:
             return f"no content expanded for {sid}"
+
+        # Persist the unfold so subsequent renders emit raw messages
+        # in place of this summary's recall pair. Without this step
+        # the agent would only see the expansion ONCE — embedded in
+        # the tool response on this turn — and on the next turn the
+        # live view would re-collapse to a recall pair. Adding ``sid``
+        # to the unfolded_summaries set in shared KV makes the unfold
+        # a render-state decision that carries across turns until
+        # ``REFOLD`` removes it.
+        unfolded = list(store.kv_get("unfolded_summaries", []) or [])
+        if sid not in unfolded:
+            unfolded.append(sid)
+            store.kv_set("unfolded_summaries", unfolded)
+
         # Inline the expanded content in the op result — the main
-        # instance sees it in the tool response, which becomes part of
-        # its own context going forward. In-place live-list injection
-        # is reserved for CM-on-behalf-of operations during compress().
+        # instance sees it in the tool response immediately, in
+        # addition to the next-turn render switching to raw.
         header = f"uncompressed {sid} → {len(expanded)} items:\n"
         body_lines = []
         for i, item in enumerate(expanded, 1):
@@ -655,6 +678,23 @@ def _dispatch_op(op: str, args: List[str], engine: "AutobioContextEngine") -> st
             preview = content.strip()
             body_lines.append(f"  [{i}] ({role}) {preview}")
         return header + "\n".join(body_lines)
+
+    if op == "REFOLD":
+        if not args:
+            return "REFOLD requires a summary ID"
+        sid = args[0]
+        unfolded = list(store.kv_get("unfolded_summaries", []) or [])
+        if sid not in unfolded:
+            return (
+                f"{sid} is not currently unfolded; nothing to refold "
+                f"(it already renders as a recall pair)"
+            )
+        unfolded.remove(sid)
+        store.kv_set("unfolded_summaries", unfolded)
+        return (
+            f"refolded {sid}: subsequent renders will emit a recall "
+            f"pair in place of the raw messages this summary covers"
+        )
 
     if op == "PIN":
         if len(args) < 1:

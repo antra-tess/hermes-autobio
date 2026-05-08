@@ -1648,5 +1648,161 @@ class CmModelProviderResolution(unittest.TestCase):
             eng.on_session_end("cm_prov", [])
 
 
+class UncompressRefoldRoundTrip(unittest.TestCase):
+    """``UNCOMPRESS <sid>`` and its inverse ``REFOLD <sid>`` toggle the
+    summary's render state by writing to the ``unfolded_summaries``
+    KV. Verified end-to-end by inspecting ``render_view`` output:
+    folded → recall pair; unfolded → raw messages; refolded → recall
+    pair again.
+    """
+
+    def setUp(self) -> None:
+        import agent.auxiliary_client  # noqa: F401
+        self.tmp = tempfile.mkdtemp(prefix="autobio_unfold_")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _seed_archive_with_one_l1(self, store) -> "tuple[str, list[str]]":
+        """Insert 4 messages, fold them into a single L1. Returns
+        ``(l1_id, source_hashes)``.
+        """
+        from plugins.autobio.ids import message_hash
+        hashes = []
+        for i in range(4):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role, "content": f"covered-msg-{i}"}
+            h = message_hash(m)
+            store.upsert_message(h, m, turn=i, position=i)
+            hashes.append(h)
+        l1_id = store.insert_summary(
+            level=1, source_hashes=hashes, source_hash="sh-uf",
+            content="I remember the four covered messages happened.",
+            tokens=80, compression_generations=1,
+        )
+        store.mark_compressed(hashes, l1_id)
+        return l1_id, hashes
+
+    def test_uncompress_persists_unfold_state(self) -> None:
+        from plugins.autobio.cm import _execute_ops
+        from plugins.autobio.engine import AutobioContextEngine
+        from plugins.autobio.render import render_view, is_recall_message
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="t", context_length=100_000)
+        eng.on_session_start("uf1", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        l1_id, _ = self._seed_archive_with_one_l1(eng._store)
+
+        # Folded baseline: render shows recall pair, no raw covered-msg-* content.
+        view = render_view(eng._store, protect_first_n=0)
+        self.assertEqual(
+            sum(1 for m in view if is_recall_message(m)), 2,
+            "expected one recall pair (header + body) for L1 in folded state",
+        )
+        joined = "\n".join(
+            (m.get("content") or "") if isinstance(m.get("content"), str)
+            else "" for m in view
+        )
+        self.assertNotIn("covered-msg-", joined)
+
+        # UNCOMPRESS via the CM op handler.
+        results = _execute_ops([f"UNCOMPRESS {l1_id}"], eng)
+        self.assertEqual(len(results), 1)
+        op_line, op_result = results[0]
+        self.assertIn(f"uncompressed {l1_id}", op_result)
+
+        # KV should now contain the L1.
+        unfolded = eng._store.kv_get("unfolded_summaries", [])
+        self.assertIn(l1_id, unfolded)
+
+        # Subsequent render: NO recall pair for this L1; raw messages
+        # come through instead.
+        view2 = render_view(
+            eng._store, protect_first_n=0,
+            unfolded_summaries=set(unfolded),
+        )
+        recall_pairs_remaining = sum(
+            1 for m in view2 if is_recall_message(m)
+        )
+        self.assertEqual(
+            recall_pairs_remaining, 0,
+            "L1's recall pair should have been replaced by raw messages",
+        )
+        joined2 = "\n".join(
+            (m.get("content") or "") if isinstance(m.get("content"), str)
+            else "" for m in view2
+        )
+        self.assertIn("covered-msg-0", joined2,
+                      "raw source messages should now appear in the view")
+
+        eng.on_session_end("uf1", [])
+
+    def test_refold_reverts_to_recall_pair(self) -> None:
+        from plugins.autobio.cm import _execute_ops
+        from plugins.autobio.engine import AutobioContextEngine
+        from plugins.autobio.render import render_view, is_recall_message
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="t", context_length=100_000)
+        eng.on_session_start("uf2", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        l1_id, _ = self._seed_archive_with_one_l1(eng._store)
+
+        # Unfold first.
+        _execute_ops([f"UNCOMPRESS {l1_id}"], eng)
+        self.assertIn(l1_id, eng._store.kv_get("unfolded_summaries", []))
+
+        # REFOLD removes from KV.
+        results = _execute_ops([f"REFOLD {l1_id}"], eng)
+        self.assertEqual(len(results), 1)
+        op_line, op_result = results[0]
+        self.assertIn(f"refolded {l1_id}", op_result)
+        self.assertNotIn(
+            l1_id, eng._store.kv_get("unfolded_summaries", []),
+        )
+
+        # Render is back to recall-pair mode.
+        view = render_view(
+            eng._store, protect_first_n=0,
+            unfolded_summaries=set(
+                eng._store.kv_get("unfolded_summaries", []),
+            ),
+        )
+        self.assertEqual(
+            sum(1 for m in view if is_recall_message(m)), 2,
+            "after REFOLD the L1 should render as a recall pair again",
+        )
+        eng.on_session_end("uf2", [])
+
+    def test_uncompress_idempotent_refold_on_unfolded_no_op(self) -> None:
+        from plugins.autobio.cm import _execute_ops
+        from plugins.autobio.engine import AutobioContextEngine
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="t", context_length=100_000)
+        eng.on_session_start("uf3", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        l1_id, _ = self._seed_archive_with_one_l1(eng._store)
+
+        # UNCOMPRESS twice — KV doesn't gain a duplicate.
+        _execute_ops([f"UNCOMPRESS {l1_id}"], eng)
+        _execute_ops([f"UNCOMPRESS {l1_id}"], eng)
+        unfolded = eng._store.kv_get("unfolded_summaries", [])
+        self.assertEqual(unfolded.count(l1_id), 1)
+
+        # REFOLD on a non-unfolded id reports no-op cleanly.
+        results = _execute_ops(["REFOLD L1-9999"], eng)
+        self.assertIn("not currently unfolded", results[0][1])
+
+        eng.on_session_end("uf3", [])
+
+
 if __name__ == "__main__":
     unittest.main()
