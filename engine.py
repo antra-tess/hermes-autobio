@@ -126,13 +126,43 @@ class AutobioContextEngine(ContextEngine):
         return tokens >= self.threshold_tokens > 0
 
     def should_compress_preflight(self, messages: List[Dict[str, Any]]) -> bool:
+        """True if a preflight compress should fire before the next
+        API call.
+
+        Two trigger conditions:
+
+        1. **Token threshold hit**: ``messages`` weighs more than the
+           configured threshold. Standard automatic-compression case.
+        2. **Pending memories in archive**: the autobio store has
+           active summaries (L1/L2/L3) but the input messages do
+           NOT already contain recall pairs surfacing them. This
+           catches transfer-in / resume scenarios where a session
+           starts with seeded memory that has to be projected into
+           conversation_history before the agent sees its own past.
+           Without this, a resumed session with light recent
+           messages would never hit threshold and the agent would
+           operate without memory until enough new conversation
+           accumulated naturally.
+        """
         if self._compression_halted:
             return False
-        # Cheap rough check — same estimate used elsewhere.
+
         from agent.model_metadata import estimate_messages_tokens_rough
-        if not self.threshold_tokens:
-            return False
-        return estimate_messages_tokens_rough(messages) >= self.threshold_tokens
+
+        if self.threshold_tokens and (
+            estimate_messages_tokens_rough(messages) >= self.threshold_tokens
+        ):
+            return True
+
+        # Memory-pending check.
+        if self._store is not None:
+            from .render import is_recall_message
+            counts = self._store.summary_counts()
+            if counts:
+                already_surfaced = any(is_recall_message(m) for m in messages)
+                if not already_surfaced:
+                    return True
+        return False
 
     def resume_compression(self) -> None:
         """Clear the halt flag after a human/CM has addressed the cause.
@@ -155,6 +185,7 @@ class AutobioContextEngine(ContextEngine):
         self,
         messages: List[Dict[str, Any]],
         current_tokens: Optional[int] = None,
+        **kwargs: Any,  # absorb runner-side hints (focus_topic, etc.)
     ) -> List[Dict[str, Any]]:
         """Archive-first, then prune, then run a compression step
         (summarize + fold), then promote L1→L2→L3 if merge thresholds
