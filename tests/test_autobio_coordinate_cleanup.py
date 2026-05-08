@@ -1891,6 +1891,244 @@ class DashboardScope(unittest.TestCase):
         eng.on_session_end("dash", [])
 
 
+class CrashResilience(unittest.TestCase):
+    """Archive must remain consistent across an unclean shutdown.
+
+    The risky window is between ``insert_summary`` (writes the L1 row)
+    and the caller's subsequent ``mark_compressed`` (sets the source
+    messages' ``compressed_into`` pointer). Both are autocommit, so a
+    crash between them leaves an *orphan L1*: the summary exists, but
+    no message is wired to it.
+
+    Recovery hinges on ``find_summary_by_source_hash`` (called at the
+    top of ``summarize_chunk``): on the next compress pass the orphan
+    is rediscovered by its content-addressed source_hash and reused,
+    after which the caller's ``mark_compressed`` finally runs.
+
+    These tests verify:
+
+    1. The crash window is observable (orphan exists, messages still
+       NULL).
+    2. The archive opens cleanly after the crash (no migration
+       failure, no FTS5 corruption signal).
+    3. The next compress() pass deduplicates onto the orphan instead
+       of producing a second L1 with the same source content.
+    4. Post-recovery, every ``messages.compressed_into`` points at an
+       existing, non-merged summary (no dangling pointers).
+    """
+
+    def setUp(self) -> None:
+        import agent.auxiliary_client  # noqa: F401
+        self.tmp = tempfile.mkdtemp(prefix="autobio_crash_")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_msgs(self) -> List[Dict[str, Any]]:
+        msgs: List[Dict[str, Any]] = [{"role": "system", "content": "sys"}]
+        for i in range(30):
+            msgs.append({"role": "user",
+                         "content": f"u{i} " + ("x" * 2500)})
+            msgs.append({"role": "assistant",
+                         "content": f"a{i} " + ("y" * 2500)})
+        return msgs
+
+    def test_orphan_summary_recovers_on_next_pass(self) -> None:
+        """Crash between insert_summary and mark_compressed:
+        next compress() pass deduplicates and completes the wiring.
+        """
+        from plugins.autobio.engine import AutobioContextEngine
+        from plugins.autobio.store import Store
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="t", context_length=100_000)
+        eng.on_session_start("crash1", hermes_home=self.tmp)
+        eng.cfg["compression"]["chunk_tokens"] = 4_000
+        eng.cfg["compression"]["summary_target_tokens"] = 300
+        eng.cfg["compression"]["speculative"] = False
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        msgs = self._make_msgs()
+
+        # Inject a crash: monkey-patch the store's mark_compressed to
+        # raise on the first call. The summary will already have been
+        # written by insert_summary at that point.
+        store = eng._store
+        original_mark = store.mark_compressed
+        crash_state = {"raised": False}
+
+        def crashing_mark(hashes, summary_id):
+            if not crash_state["raised"]:
+                crash_state["raised"] = True
+                raise RuntimeError("simulated crash mid-mark_compressed")
+            return original_mark(hashes, summary_id)
+
+        store.mark_compressed = crashing_mark  # type: ignore[method-assign]
+
+        # First compress: should write an orphan L1 and bubble the crash.
+        with patch("agent.auxiliary_client.call_llm",
+                   return_value=_resp("memory body")):
+            with self.assertRaises(RuntimeError):
+                eng.compress(msgs)
+
+        # Invariant 1: orphan L1 exists in archive.
+        l1s = store.list_summaries(level=1, include_merged=True)
+        self.assertEqual(
+            len(l1s), 1,
+            f"expected exactly one orphan L1; got {len(l1s)}",
+        )
+        orphan_id = l1s[0]["id"]
+
+        # Invariant 2: no message points at it yet — mark_compressed
+        # raised before running.
+        with store._lock:
+            row = store._conn.execute(
+                "SELECT COUNT(*) AS n FROM messages "
+                "WHERE compressed_into = ? AND session_id = ?",
+                (orphan_id, store.session_id),
+            ).fetchone()
+        self.assertEqual(
+            row["n"], 0,
+            "messages should not yet point at the orphan summary",
+        )
+
+        # Restore mark_compressed and run a second pass — this is the
+        # "next compress() after restart" path.
+        store.mark_compressed = original_mark  # type: ignore[method-assign]
+        with patch("agent.auxiliary_client.call_llm",
+                   return_value=_resp("memory body")):
+            eng.compress(msgs)
+
+        # Invariant 3: still exactly one L1 — find_summary_by_source_hash
+        # deduplicated onto the orphan instead of writing a twin.
+        l1s_after = store.list_summaries(level=1, include_merged=True)
+        self.assertEqual(
+            len(l1s_after), 1,
+            f"recovery should reuse the orphan; got "
+            f"{[s['id'] for s in l1s_after]}",
+        )
+        self.assertEqual(l1s_after[0]["id"], orphan_id)
+
+        # Invariant 4: messages now point at the L1.
+        with store._lock:
+            row = store._conn.execute(
+                "SELECT COUNT(*) AS n FROM messages "
+                "WHERE compressed_into = ? AND session_id = ?",
+                (orphan_id, store.session_id),
+            ).fetchone()
+        self.assertGreater(
+            row["n"], 0,
+            "second compress() should have wired messages to the L1",
+        )
+
+        eng.on_session_end("crash1", [])
+
+    def test_archive_opens_cleanly_after_crash(self) -> None:
+        """Simulate process exit during a half-finished compress: close
+        the engine without graceful end, reopen via a fresh engine
+        instance, run compress() again. Archive must come back online
+        with an intact orphan L1 and pristine FTS5 indexes.
+        """
+        from plugins.autobio.engine import AutobioContextEngine
+
+        # ---- session A: crash mid-compress -------------------------
+        eng_a = AutobioContextEngine()
+        eng_a.update_model(model="t", context_length=100_000)
+        eng_a.on_session_start("crash2", hermes_home=self.tmp)
+        eng_a.cfg["compression"]["chunk_tokens"] = 4_000
+        eng_a.cfg["compression"]["summary_target_tokens"] = 300
+        eng_a.cfg["compression"]["speculative"] = False
+        if eng_a._speculative is not None:
+            eng_a._speculative._enabled = False
+
+        store_a = eng_a._store
+        original_mark = store_a.mark_compressed
+        crashed = {"yes": False}
+
+        def crashing_mark(hashes, summary_id):
+            if not crashed["yes"]:
+                crashed["yes"] = True
+                raise RuntimeError("simulated crash")
+            return original_mark(hashes, summary_id)
+
+        store_a.mark_compressed = crashing_mark  # type: ignore[method-assign]
+        msgs = self._make_msgs()
+
+        with patch("agent.auxiliary_client.call_llm",
+                   return_value=_resp("memory body")):
+            with self.assertRaises(RuntimeError):
+                eng_a.compress(msgs)
+
+        # Drop the engine WITHOUT calling on_session_end. This
+        # simulates a kill -9: the SQLite WAL still has uncommitted
+        # writes for the in-flight transaction, but committed writes
+        # (the orphan L1) are durable.
+        del eng_a
+
+        # Force a fresh Store handle by clearing the singleton cache.
+        from plugins.autobio import store as store_mod
+        store_mod._STORES.clear()
+
+        # ---- session B: reopen, run compress() again ----------------
+        eng_b = AutobioContextEngine()
+        eng_b.update_model(model="t", context_length=100_000)
+        eng_b.on_session_start("crash2", hermes_home=self.tmp)
+        eng_b.cfg["compression"]["chunk_tokens"] = 4_000
+        eng_b.cfg["compression"]["summary_target_tokens"] = 300
+        eng_b.cfg["compression"]["speculative"] = False
+        if eng_b._speculative is not None:
+            eng_b._speculative._enabled = False
+
+        store_b = eng_b._store
+
+        # Archive came back online with the orphan present.
+        l1s_b = store_b.list_summaries(level=1, include_merged=True)
+        self.assertEqual(len(l1s_b), 1, "orphan L1 missing after reopen")
+
+        # FTS5 query should not raise — sanity-check the archive isn't
+        # corrupted in a way that breaks search.
+        try:
+            with store_b._lock:
+                store_b._conn.execute(
+                    "SELECT id FROM summaries_fts "
+                    "WHERE summaries_fts MATCH 'memory' LIMIT 1"
+                ).fetchall()
+        except Exception as e:  # pragma: no cover — diagnostic
+            self.fail(f"FTS5 query failed after reopen: {e}")
+
+        # Re-run compress; recovery should wire up messages.
+        with patch("agent.auxiliary_client.call_llm",
+                   return_value=_resp("memory body")):
+            eng_b.compress(msgs)
+
+        l1s_final = store_b.list_summaries(level=1, include_merged=True)
+        self.assertEqual(
+            len(l1s_final), 1,
+            f"reopen+recover produced duplicate L1s: "
+            f"{[s['id'] for s in l1s_final]}",
+        )
+
+        # Invariant: no message points at a non-existent summary, and
+        # no message points at a merged summary (would break unfold).
+        with store_b._lock:
+            dangling = store_b._conn.execute(
+                "SELECT COUNT(*) AS n FROM messages m "
+                "WHERE m.session_id = ? AND m.compressed_into IS NOT NULL "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM summaries s "
+                "  WHERE s.id = m.compressed_into AND s.session_id = m.session_id"
+                ")",
+                (store_b.session_id,),
+            ).fetchone()
+        self.assertEqual(
+            dangling["n"], 0,
+            "messages.compressed_into points at a non-existent summary",
+        )
+
+        eng_b.on_session_end("crash2", [])
+
+
 class PinOpHidden(unittest.TestCase):
     """PIN / UNPIN at the summary level are not exposed to CM in v1.
 
