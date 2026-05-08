@@ -129,20 +129,34 @@ class AutobioContextEngine(ContextEngine):
         """True if a preflight compress should fire before the next
         API call.
 
-        Two trigger conditions:
+        Three independent trigger conditions, any of which forces
+        the runner to call ``compress()``:
 
         1. **Token threshold hit**: ``messages`` weighs more than the
            configured threshold. Standard automatic-compression case.
-        2. **Pending memories in archive**: the autobio store has
-           active summaries (L1/L2/L3) but the input messages do
-           NOT already contain recall pairs surfacing them. This
-           catches transfer-in / resume scenarios where a session
-           starts with seeded memory that has to be projected into
-           conversation_history before the agent sees its own past.
-           Without this, a resumed session with light recent
-           messages would never hit threshold and the agent would
-           operate without memory until enough new conversation
-           accumulated naturally.
+        2. **Compression halt cleared and pending content**: skipped
+           if halted; otherwise see (3).
+        3. **Any active summary exists**: as long as the archive has
+           memory the engine should own, fire so ``compress()`` can
+           re-render the conversation from current archive state. This
+           covers:
+
+             - Transfer-in / resume: a session with seeded memory
+               that has to be projected into conversation_history
+               before the first API call.
+             - Mid-session UNCOMPRESS / REFOLD: the
+               ``unfolded_summaries`` KV set changed so the
+               rendered view needs to switch a region between recall
+               pair and raw messages.
+             - Newly-formed L1s from the previous turn that aren't
+               yet reflected in the runner's conversation_history.
+
+        Re-rendering is cheap (a SQL walk + a few list ops). The
+        actual cost-bearing work — calling the summarizer LLM —
+        only fires inside ``compress_step_archive`` when the picker
+        finds an eligible chunk. So firing preflight every turn for
+        memory-bearing sessions has negligible cost beyond the
+        per-turn render itself.
         """
         if self._compression_halted:
             return False
@@ -154,14 +168,12 @@ class AutobioContextEngine(ContextEngine):
         ):
             return True
 
-        # Memory-pending check.
-        if self._store is not None:
-            from .render import is_recall_message
-            counts = self._store.summary_counts()
-            if counts:
-                already_surfaced = any(is_recall_message(m) for m in messages)
-                if not already_surfaced:
-                    return True
+        # Always fire when there's memory to keep the rendered view
+        # in sync with archive state (UNCOMPRESS toggles, new L1s,
+        # transfer-in seeding).
+        if self._store is not None and self._store.summary_counts():
+            return True
+
         return False
 
     def resume_compression(self) -> None:
