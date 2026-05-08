@@ -1806,7 +1806,7 @@ class UncompressRefoldRoundTrip(unittest.TestCase):
 
 class DashboardScope(unittest.TestCase):
     """The L1 row of CM's dashboard must include merged L1s so CM can
-    UNCOMPRESS / REFOLD / PIN any L1 currently in the agent's prompt.
+    UNCOMPRESS / REFOLD any L1 currently in the agent's prompt.
     Under the balance rule, render emits a recall pair for every L1
     in the archive — active OR merged into a parent.
     """
@@ -1889,6 +1889,55 @@ class DashboardScope(unittest.TestCase):
         # l2.count — verify by reading the count.
         self.assertEqual(dashboard["layers"]["l2"]["count"], 1)
         eng.on_session_end("dash", [])
+
+
+class PinOpHidden(unittest.TestCase):
+    """PIN / UNPIN at the summary level are not exposed to CM in v1.
+
+    Under the balance rule render emits every L1 (active or merged) as
+    a recall pair regardless of ``summaries.pinned``, so summary-level
+    pinning has no observable effect. We hide the ops to avoid the
+    foot-gun where CM issues a "protection" the agent thinks is
+    working.
+
+    The op handler is kept (returns an explanatory error) so a CM that
+    hallucinates the op from training data gets a clear signal rather
+    than a silent success.
+    """
+
+    def test_pin_unpin_not_in_cm_system_prompt(self) -> None:
+        from plugins.autobio.cm import CM_SYSTEM_PROMPT
+
+        # The op names should not appear as instruction lines in the
+        # available-operations list. Fail loud if they sneak back in.
+        # We check for the canonical "  PIN " / "  UNPIN " indented
+        # forms used in the op enumeration so we don't trip on the
+        # word "pin" elsewhere (e.g. "MARK_DOCUMENT" doesn't contain
+        # PIN as a token, but a future doc string might mention pins).
+        self.assertNotIn("\n  PIN ", CM_SYSTEM_PROMPT)
+        self.assertNotIn("\n  UNPIN ", CM_SYSTEM_PROMPT)
+
+    def test_pin_op_returns_explanatory_error(self) -> None:
+        from plugins.autobio.cm import _execute_ops
+        from plugins.autobio.engine import AutobioContextEngine
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="t", context_length=100_000)
+        tmp = tempfile.mkdtemp(prefix="autobio_pinhide_")
+        try:
+            eng.on_session_start("pinhide", hermes_home=tmp)
+            results = _execute_ops(["PIN L1-0001"], eng)
+            self.assertEqual(len(results), 1)
+            # Result should explain the op is unavailable, not silently
+            # succeed.
+            _, msg = results[0]
+            self.assertIn("not available", msg.lower())
+            results = _execute_ops(["UNPIN L1-0001"], eng)
+            _, msg = results[0]
+            self.assertIn("not available", msg.lower())
+            eng.on_session_end("pinhide", [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

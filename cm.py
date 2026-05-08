@@ -22,11 +22,18 @@ CM operations (parsed out of CM's response by ``_execute_ops``):
                            op's result for the main instance to see now
   REFOLD <summary_id>    → inverse of UNCOMPRESS: revert to showing the
                            summary as a recall pair on subsequent renders
-  PIN    <summary_id> <reason>  → mark a summary pinned
-  UNPIN  <summary_id>    → remove pin
   SET_INTERVAL <N>       → change proactive check-in frequency
   MERGE  <level>         → force a merge pass at the given level
   DEFER  <N> <reason>    → skip this check-in, reschedule N turns ahead
+
+PIN / UNPIN at the summary level are NOT exposed in v1. The
+``summaries.pinned`` column exists, but no code path reads it: under
+the balance rule render emits every L1 (active or merged) as a recall
+pair, so "protect from merging" has no observable effect on what the
+agent sees. The ops will be re-introduced when v2 adaptive resolution
+lands and merge state actually controls render fidelity. For range-
+level protection (keep raw messages from being folded), use
+MARK_DOCUMENT instead — that path is fully wired.
 """
 
 from __future__ import annotations
@@ -75,8 +82,6 @@ Available operations:
   REFOLD L1-0042                — inverse of UNCOMPRESS: revert the live
                                   view to showing this summary as a
                                   recall pair instead of raw messages
-  PIN L1-0014 "auth refactor"   — protect a summary from merging
-  UNPIN L1-0014                 — remove pin
   MARK_DOCUMENT <start> <end> [style] [title]
                                 — register a protected document range
                                   (style: chronological|monolithic)
@@ -338,8 +343,8 @@ def build_dashboard(
         # balance rule, ``render_view`` walks ``messages.compressed
         # _into`` directly and emits a recall pair for every L1 the
         # archive contains — active OR merged_into a parent. CM
-        # needs to see the same set so it can UNCOMPRESS / REFOLD /
-        # PIN any L1 the agent currently has in its live view.
+        # needs to see the same set so it can UNCOMPRESS / REFOLD
+        # any L1 the agent currently has in its live view.
         # If we filter to active-only here, an L1 that's been rolled
         # up into an L2 disappears from the dashboard while still
         # appearing in the agent's prompt, and CM responds "L1-X
@@ -716,19 +721,21 @@ def _dispatch_op(op: str, args: List[str], engine: "AutobioContextEngine") -> st
             f"pair in place of the raw messages this summary covers"
         )
 
-    if op == "PIN":
-        if len(args) < 1:
-            return "PIN requires a summary ID"
-        sid = args[0]
-        reason = " ".join(args[1:]) if len(args) > 1 else ""
-        store.set_pin(sid, True)
-        return f"pinned {sid}" + (f" ({reason})" if reason else "")
-
-    if op == "UNPIN":
-        if not args:
-            return "UNPIN requires a summary ID"
-        store.set_pin(args[0], False)
-        return f"unpinned {args[0]}"
+    if op in ("PIN", "UNPIN"):
+        # Not exposed in v1 — see module docstring. Under the balance
+        # rule render emits every L1 (active or merged) regardless of
+        # the ``summaries.pinned`` flag, so PIN/UNPIN have no
+        # observable effect. Returning a clear explanation rather than
+        # silently succeeding avoids the foot-gun where CM thinks a
+        # protection it issued is doing something. Use MARK_DOCUMENT
+        # for range-level protection of raw messages.
+        return (
+            f"{op} is not available in v1. Summary-level pinning has "
+            f"no observable effect under the current balance-rule "
+            f"render (every L1 is shown as a recall pair regardless "
+            f"of pin state). Use MARK_DOCUMENT to protect raw message "
+            f"ranges from being folded."
+        )
 
     if op == "SET_INTERVAL":
         if not args:
