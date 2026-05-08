@@ -1518,6 +1518,167 @@ class MainLlmCallRecording(unittest.TestCase):
         eng.on_session_end("mlc3", [])
 
 
+class LlmCallShapeCoverage(unittest.TestCase):
+    """on_llm_call must handle the real response shapes that production
+    runners produce, not just MagicMocks with arbitrary attribute access:
+
+    1. **Streaming-reconstructed**: runner builds a ``SimpleNamespace``
+       from streamed deltas. Same fields as OpenAI but no defaultdict
+       ``MagicMock`` magic — missing attributes raise.
+    2. **Anthropic with thinking + text blocks**: response.content
+       contains both a thinking block (no .text) and a text block,
+       plus a tool_use block. Text concatenation must skip the
+       non-text blocks without crashing on missing .text.
+    3. **Anthropic with tool_use only (no text)**: response.content
+       contains only tool_use blocks, no text. response_text should
+       end up empty string, not None or crash.
+    """
+
+    def setUp(self) -> None:
+        import agent.auxiliary_client  # noqa: F401
+        self.tmp = tempfile.mkdtemp(prefix="autobio_lcsc_")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_openai_shape_via_simplenamespace(self) -> None:
+        """Runner's _interruptible_streaming_api_call returns a
+        SimpleNamespace mimicking the non-streaming OpenAI shape.
+        Verify on_llm_call extracts content + usage cleanly.
+        """
+        from types import SimpleNamespace
+        from plugins.autobio.engine import AutobioContextEngine
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="haiku-4-5", context_length=200_000)
+        eng.on_session_start("lcsc1", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        # SimpleNamespace doesn't auto-vivify attrs the way MagicMock
+        # does — accessing a missing attribute raises AttributeError.
+        # This catches code that assumes attributes exist when they
+        # don't (which a MagicMock test would silently pass).
+        msg = SimpleNamespace(content="streamed response body",
+                              role="assistant")
+        choice = SimpleNamespace(message=msg, finish_reason="stop",
+                                 index=0)
+        usage = SimpleNamespace(prompt_tokens=1234, completion_tokens=42,
+                                total_tokens=1276)
+        response = SimpleNamespace(
+            id="msg_xyz",
+            model="anthropic/claude-haiku-4-5",
+            choices=[choice],
+            usage=usage,
+        )
+
+        api_kwargs = {
+            "model": "anthropic/claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "go"}],
+        }
+        eng.on_llm_call(api_kwargs, response)
+
+        calls = eng._store.list_llm_calls()
+        main = [c for c in calls if c["purpose"] == "main"]
+        self.assertEqual(len(main), 1)
+        c = main[0]
+        self.assertEqual(c["response_text"], "streamed response body")
+        self.assertEqual(c["response_finish"], "stop")
+        self.assertEqual(c["prompt_tokens"], 1234)
+        self.assertEqual(c["completion_tokens"], 42)
+
+        eng.on_session_end("lcsc1", [])
+
+    def test_anthropic_native_with_thinking_and_tool_use_blocks(self) -> None:
+        """Real Anthropic responses for tool-using turns contain a
+        mix of block types: thinking (extended thinking models),
+        text (the visible response), and tool_use (the tool call).
+        on_llm_call must concatenate text blocks only, skipping
+        non-text blocks without crashing on missing .text attribute.
+        """
+        from types import SimpleNamespace
+        from plugins.autobio.engine import AutobioContextEngine
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="claude", context_length=200_000)
+        eng.on_session_start("lcsc2", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        # Thinking block: has .thinking but no .text attribute on the
+        # Anthropic SDK type. We model that with SimpleNamespace which
+        # raises AttributeError when .text is accessed.
+        thinking_block = SimpleNamespace(type="thinking",
+                                          thinking="let me think...")
+        # Text block: has .text.
+        text_block = SimpleNamespace(type="text",
+                                     text="The answer is 42.")
+        # Tool-use block: has .input/.name but no .text.
+        tool_block = SimpleNamespace(type="tool_use",
+                                     name="calculator",
+                                     input={"expr": "6*7"},
+                                     id="toolu_abc")
+        response = SimpleNamespace(
+            id="msg_anthropic_native",
+            model="claude-haiku-4-5",
+            content=[thinking_block, text_block, tool_block],
+            stop_reason="tool_use",
+            usage=SimpleNamespace(input_tokens=600, output_tokens=25),
+        )
+        api_kwargs = {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "what's 6*7?"}],
+        }
+        eng.on_llm_call(api_kwargs, response)
+
+        calls = eng._store.list_llm_calls()
+        main = [c for c in calls if c["purpose"] == "main"]
+        self.assertEqual(len(main), 1)
+        c = main[0]
+        # Only the text block's content lands in response_text.
+        self.assertEqual(c["response_text"], "The answer is 42.")
+        self.assertEqual(c["response_finish"], "tool_use")
+        self.assertEqual(c["prompt_tokens"], 600)
+        self.assertEqual(c["completion_tokens"], 25)
+
+        eng.on_session_end("lcsc2", [])
+
+    def test_anthropic_native_tool_use_only_no_text(self) -> None:
+        """Edge case: agent emits only tool_use blocks, no text.
+        response_text should be empty string, recording succeeds.
+        """
+        from types import SimpleNamespace
+        from plugins.autobio.engine import AutobioContextEngine
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="claude", context_length=200_000)
+        eng.on_session_start("lcsc3", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        tool_block = SimpleNamespace(type="tool_use", name="x",
+                                     input={}, id="toolu_x")
+        response = SimpleNamespace(
+            content=[tool_block],
+            stop_reason="tool_use",
+            usage=SimpleNamespace(input_tokens=100, output_tokens=10),
+        )
+        api_kwargs = {"model": "claude", "messages": [
+            {"role": "user", "content": "use the tool"},
+        ]}
+        eng.on_llm_call(api_kwargs, response)
+
+        calls = eng._store.list_llm_calls()
+        main = [c for c in calls if c["purpose"] == "main"]
+        self.assertEqual(len(main), 1)
+        # Empty string, not None — distinguishes "model returned no text"
+        # from "we couldn't extract anything from the response".
+        self.assertEqual(main[0]["response_text"], "")
+        self.assertEqual(main[0]["response_finish"], "tool_use")
+
+        eng.on_session_end("lcsc3", [])
+
+
 class CmModelProviderResolution(unittest.TestCase):
     """The CM model name needs to match the resolved auxiliary
     provider. Bare ``claude-sonnet-4-6`` works on direct Anthropic
