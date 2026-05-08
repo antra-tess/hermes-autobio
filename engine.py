@@ -20,7 +20,7 @@ from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
 
 from .config import load_autobio_config
 from .ids import message_hash
-from .render import is_marker_message, known_marker_hashes, render_view
+from .render import is_recall_message, known_recall_hashes, render_view
 from .store import Store, close_store, get_store
 
 logger = logging.getLogger(__name__)
@@ -284,16 +284,16 @@ class AutobioContextEngine(ContextEngine):
         from .tool_naming import build_tool_args_index, enrich_tool_name
         args_index = build_tool_args_index(messages)
 
-        marker_hashes = known_marker_hashes(self._store)
+        recall_hashes = known_recall_hashes(self._store)
         next_pos = self._next_position()
         current_turn = self._current_turn()
         for msg in messages:
             try:
-                if is_marker_message(msg):
+                if is_recall_message(msg):
                     continue
                 enriched = enrich_tool_name(msg, args_index)
                 h = message_hash(enriched)
-                if h in marker_hashes:
+                if h in recall_hashes:
                     continue   # belt-and-braces: matches an active marker
                 # If already archived, upsert is a no-op via INSERT OR
                 # IGNORE. Position passed here is only used on first
@@ -636,8 +636,8 @@ class AutobioContextEngine(ContextEngine):
 
         Idempotent via ``INSERT OR IGNORE`` on the content hash. Stale
         render markers from prior compress() calls are recognized via
-        :func:`is_marker_message` plus a hash check against
-        ``known_marker_hashes`` and explicitly skipped — archiving them
+        :func:`is_recall_message` plus a hash check against
+        ``known_recall_hashes`` and explicitly skipped — archiving them
         as messages would let the picker see them as foldable content,
         producing the recursive Torment Nexus the projection model
         was designed to prevent.
@@ -663,20 +663,20 @@ class AutobioContextEngine(ContextEngine):
         # results with the file extension at archive time.
         args_index = build_tool_args_index(messages)
 
-        marker_hashes = known_marker_hashes(self._store)
+        recall_hashes = known_recall_hashes(self._store)
         next_pos = self._next_position()
         current_turn = self._current_turn()
         failure_count = 0
         for msg in messages:
             try:
-                if is_marker_message(msg):
+                if is_recall_message(msg):
                     continue
                 # Enrich tool results with extension-suffixed name so
                 # the hash and the stored row agree (and so the picker
                 # weight lookup picks up Read:md vs Read:py).
                 enriched = enrich_tool_name(msg, args_index)
                 h = message_hash(enriched)
-                if h in marker_hashes:
+                if h in recall_hashes:
                     continue   # belt-and-braces
                 if self._store.get_message(h) is not None:
                     continue   # already archived

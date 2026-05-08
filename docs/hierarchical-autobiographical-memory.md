@@ -16,6 +16,33 @@ rediscover them.
 
 ---
 
+## Terminology
+
+Two distinct concepts that early drafts of this design (and the v1
+implementation) confused under the single word "marker." Resolved:
+
+- **Marker** — the in-band priming text inserted into the
+  *summarizer prompt* between head and chunk. The string is "System:
+  You will soon form a new memory, get ready..." (`_MARKER` in
+  `compression.py`). It tells *the summarizer* "the next slice is
+  what you're forming a memory of." Visible only during memory
+  writing; never appears in the main agent's live view.
+
+- **Recall pair** — the live-view representation of a folded region.
+  A two-turn dialogue placed where the original messages used to be:
+  `[user "[CM] Recall memory L1-X (gen N)."]` followed by
+  `[assistant "<first-person body>"]`. CM (in user role) asks the
+  agent to recall the memory; the agent (in assistant role)
+  produces the recall — the memory's content, exactly as the
+  summarizer wrote it. This is how memories arrive in any LLM call
+  the agent makes, not just summarizer prompts.
+
+The two concepts have nothing in common except the unfortunate
+shared name in earlier text. When this doc says "marker" without
+qualification it means the summarizer-prompt priming text.
+
+---
+
 ## Core principles
 
 Four invariants everything else follows from. Read these first.
@@ -153,7 +180,8 @@ archive. **Does not touch the live view.**
 ### fold_chunk — display mutation
 
 Given a chunk and its already-committed summary ID, replaces the
-chunk in the live message list with a summary marker. No LLM call.
+chunk in the live message list with a **recall pair** (CM-voice user
+header + agent-voice assistant body). No LLM call.
 
 - This is the decision gated by pins, documents, and token pressure
 - Callers should run summarize_chunk first (or verify via
@@ -162,9 +190,11 @@ chunk in the live message list with a summary marker. No LLM call.
 
 ### unfold — display restoration
 
-Inverse of fold. Given a summary ID, locates its marker in the live
-list and expands back to source messages from the archive. For L1s
-the source is raw messages; for L2/L3 it's child summary markers.
+Inverse of fold. Given a summary ID, locates its recall pair in the
+live list and expands back to source messages from the archive. For
+L1s the source is raw messages; for L2/L3 it's the constituent L1s'
+recall pairs (the "fill lower orbitals first" rule means L2/L3 are
+themselves rendered as their L1 children's recall pairs).
 
 - Works at any time regardless of fold state
 - Token budget may require folding something else first; CM mediates

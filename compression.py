@@ -347,9 +347,12 @@ def fold_chunk(
     chunk_hashes = [message_hash(m) for m in messages[chunk_start:chunk_end]]
     store.mark_compressed(chunk_hashes, summary_id)
 
-    # Step 2 (in-memory): swap the live view.
-    marker = _make_summary_marker(summary_id, summary_text, level=int(summary["level"]))
-    new_messages = messages[:chunk_start] + [marker] + messages[chunk_end:]
+    # Step 2 (in-memory): swap the live view. The folded chunk gets
+    # replaced by a recall pair (two messages: a CM-voice user header
+    # asking the agent to recall the memory, and the agent's
+    # first-person body). Same shape as ``render_view`` would emit.
+    recall_pair = _make_recall_pair(summary)
+    new_messages = messages[:chunk_start] + recall_pair + messages[chunk_end:]
     return _sanitize_tool_pairs(new_messages)
 
 
@@ -358,24 +361,28 @@ def unfold(
     summary_id: str,
     store: Store,
 ) -> List[Dict[str, Any]]:
-    """Inverse of fold: replace a summary marker in the live view with
+    """Inverse of fold: replace a recall pair in the live view with
     its source messages restored from archive.
 
-    Locates the marker for ``summary_id`` in ``messages`` and swaps it
-    out for the original content. For L1s the sources are raw messages;
-    for L2/L3 they are child summary markers (rendered as user-role
-    pseudo-messages so the sequence stays well-formed).
+    Locates the recall pair for ``summary_id`` in ``messages`` and
+    swaps the two-turn pair (header + body) out for the original
+    content. For L1s the sources are raw messages; for L2/L3 they
+    are child summary references rendered the same way ``render_view``
+    would emit them.
 
-    Returns the list unchanged if no marker is found. Re-raises
+    Returns the list unchanged if no recall pair is found. Re-raises
     ``UnfoldFailed`` so the caller can surface incomplete archives
     rather than silently restoring partial content.
     """
     from .search import UnfoldFailed, expand_summary
 
-    marker_idx = _find_marker_index(messages, summary_id)
-    if marker_idx is None:
-        logger.debug("autobio unfold: no marker for %s in live view", summary_id)
+    span = _find_recall_pair_span(messages, summary_id)
+    if span is None:
+        logger.debug(
+            "autobio unfold: no recall pair for %s in live view", summary_id,
+        )
         return messages
+    start_idx, end_idx = span  # half-open: [start, end)
 
     try:
         expanded = expand_summary(store, summary_id)
@@ -385,7 +392,7 @@ def unfold(
     if not expanded:
         return messages
 
-    new_messages = messages[:marker_idx] + expanded + messages[marker_idx + 1:]
+    new_messages = messages[:start_idx] + expanded + messages[end_idx:]
     return _sanitize_tool_pairs(new_messages)
 
 
@@ -1054,23 +1061,45 @@ def _range_starting_at(
 compress_to_l1 = compress_step
 
 
-def _find_marker_index(
+def _find_recall_pair_span(
     messages: List[Dict[str, Any]], summary_id: str,
-) -> Optional[int]:
-    """Return the index of the summary marker for ``summary_id``, or None.
+) -> Optional[Tuple[int, int]]:
+    """Return the half-open ``[start, end)`` indices of the recall
+    pair for ``summary_id`` in ``messages``, or ``None``.
 
-    Recognizes both the new tiny-marker prefix ``[autobio:memory`` and
-    the legacy ``[memory L`` prefix so callers that still hold a
-    pre-refactor live list (e.g., older tests) keep working.
+    Recognizes the canonical recall header ``[CM] Recall memory <id>
+    (gen N).`` (current format) and falls back to the legacy
+    ``[autobio:memory <id>`` and ``[memory L<id>`` prefixes so older
+    pre-refactor live lists still unfold.
+
+    The end index is the index AFTER the recall pair's last
+    message — the body for new-style pairs (so end = start + 2),
+    or just past the header for legacy single-message markers
+    (end = start + 1). Callers do ``messages[:start] + expanded +
+    messages[end:]`` either way.
     """
+    from .render import _RECALL_HEADER_PREFIX, _RECALL_FLAG
     for i, m in enumerate(messages):
         content = m.get("content")
         if not isinstance(content, str):
             continue
         if summary_id not in content:
             continue
+        # New canonical recall header.
+        if content.startswith(_RECALL_HEADER_PREFIX):
+            # Determine span: include the immediately-following
+            # assistant body if it's flagged as the recall pair's
+            # body, else treat as a header-only span (legacy pre-pair
+            # state where compression layered the body separately).
+            end = i + 1
+            if (end < len(messages)
+                and messages[end].get("role") == "assistant"
+                and messages[end].get(_RECALL_FLAG) is True):
+                end += 1
+            return (i, end)
+        # Legacy single-message marker (pre-recall-pair).
         if "[autobio:memory" in content or "[memory L" in content:
-            return i
+            return (i, i + 1)
     return None
 
 
@@ -1786,38 +1815,44 @@ def _call_summarizer(
 
 
 # ---------------------------------------------------------------------------
-# Internal: summary marker + tool pair sanitization
+# Internal: recall pair + tool pair sanitization
 # ---------------------------------------------------------------------------
 
-def _make_summary_marker(summary_id: str, summary: str, level: int) -> Dict[str, Any]:
-    """Build the live-view marker for a summary.
+def _make_recall_pair(summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build the two-turn recall pair representing a folded region.
 
-    Tiny — ~50 tokens — because under the projection model the marker
-    is regenerated on every render and the full L1 body lives in the
-    archive (CM fetches via memory_read / UNCOMPRESS). Prior versions
-    inlined the whole summary text, which caused the live tail to grow
-    instead of shrink on fold and let the picker recursively fold its
-    own output.
+    Mirrors ``render._make_recall_pair`` so the legacy list-based
+    ``fold_chunk`` path produces output of the same shape that
+    ``render_view`` would emit on the next pass.
 
-    Uses ``role=user`` because the marker is a synthetic CM-voice
-    pointer, not content produced by the agent. The agent's actual
-    memory body lives in the archive (and would land in an
-    assistant turn if/when surfaced via cm_manage_context).
+    The two turns are:
 
-    The ``_autobio_marker`` flag lets reconcile paths recognize
-    markers by schema; the prefix ``[autobio:memory`` is a fallback
-    for round-trips that drop unknown keys.
+    - **Header** (CM-voice ``user`` message): tells the agent which
+      memory is being surfaced. Header text starts with the
+      ``[CM] Recall memory `` sentinel so the prefix-fallback
+      detector can recognize it even if the structural flag is
+      stripped on a JSON round-trip.
+    - **Body** (``assistant`` message): the agent's first-person
+      memory content, exactly as the summarizer wrote it.
+
+    Both turns carry the ``_autobio_recall`` flag for structural
+    recognition by reconcile / archive paths.
     """
-    from .render import _MARKER_FLAG
-    tokens_hint = max(1, len(summary) // _CHARS_PER_TOKEN) if summary else 0
-    return {
+    from .render import _RECALL_FLAG, _RECALL_HEADER_PREFIX
+    sid = summary.get("id", "")
+    gen = int(summary.get("compression_generations", 1) or 1)
+    body_text = summary.get("content") or ""
+    header = {
         "role": "user",
-        "content": (
-            f"[autobio:memory {summary_id} · L{level} · {tokens_hint}t · "
-            f"call cm_manage_context to expand]"
-        ),
-        _MARKER_FLAG: True,
+        "content": f"{_RECALL_HEADER_PREFIX}{sid} (gen {gen}).",
+        _RECALL_FLAG: True,
     }
+    body = {
+        "role": "assistant",
+        "content": body_text,
+        _RECALL_FLAG: True,
+    }
+    return [header, body]
 
 
 def _sanitize_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -8,23 +8,37 @@ turn.
 Pure: no LLM calls, no mutation. Same archive state always yields
 the same rendered list (modulo opts).
 
-Algorithm:
+## Terminology
+
+Two distinct concepts that earlier versions of the code conflated
+under the word "marker":
+
+- **marker** — the in-band priming text the SUMMARIZER prompt
+  carries (``compression._MARKER`` = "System: You will soon form a
+  new memory, get ready..."). Visible only during the LLM call that
+  forms a memory; tells the summarizer which slice of the prompt to
+  write a memory for. **Not** part of the live view at all.
+- **recall pair** — the live-view representation of a folded
+  region. A two-turn dialogue placed where the original messages
+  would have been: ``[user "[CM] Recall memory L1-X (gen N)."]`` +
+  ``[assistant "<first-person body>"]``. Same shape as the
+  CM-asks/agent-recalls pattern used inside summarizer prompts.
+  This module is concerned exclusively with recall pairs.
+
+## Algorithm
 
 1. Walk archived messages in ``position`` order.
-2. For each message, compute its **active marker** — the highest-level
-   non-merged summary covering it (chain via
-   ``messages.compressed_into`` → ``summaries.merged_into``).
-3. Group consecutive messages by active marker. Within a group:
-   - active marker is None → emit each message verbatim as a raw
-     conversation message.
-   - active marker is a summary → emit one tiny marker for that
-     summary in place of all the messages it covers.
-4. Sanitize tool pairs (existing helper).
-
-Tiny markers: a marker is a few-token reference, not the full L1
-text. CM can fetch the full text via ``memory_read`` / ``UNCOMPRESS``.
-This keeps the live tail proportional to "uncovered messages + N
-small markers" instead of "uncovered + accumulated full L1 bodies."
+2. For each message, look at ``compressed_into`` directly — the L1
+   the message was folded into. We do not walk up to L2/L3:
+   "fill lower orbitals first" / adaptive-resolution rule. The L1
+   is the highest-fidelity available representation; the L2/L3
+   structure exists only for budget-constrained scenarios that
+   v1 doesn't yet handle.
+3. Group consecutive messages by their L1. For each group emit ONE
+   recall pair for that L1.
+4. Uncovered messages (``compressed_into IS NULL``) and messages
+   whose L1 has been explicitly unfolded pass through verbatim.
+5. Sanitize tool pairs (existing helper).
 """
 
 from __future__ import annotations
@@ -38,27 +52,22 @@ from .store import Store
 logger = logging.getLogger(__name__)
 
 
-# Render-time markers carry an explicit ``_autobio_marker = True``
-# dict key. That's the primary signal: schema, not content heuristic.
-# Earlier revisions identified markers by content prefix alone, which
-# meant any path that built a marker had to remember the exact prefix
-# string and any path that consumed one had to know the heuristic.
-# The flag turns "is this a marker?" into a structural answer that
-# every code path agrees on.
-#
-# The prefix string is still useful as belt-and-braces for two cases:
-# the dict survives a round-trip that drops unknown keys (rare — most
-# message storage in Hermes is plain Python dicts) and very old stored
-# state from before the flag was introduced. ``is_marker_message``
-# falls back to the prefix at warning level.
-_MARKER_PREFIX = "[autobio:memory "
-_MARKER_FLAG = "_autobio_marker"
+# Recall-pair recognition. The header (CM-voice user turn) starts
+# with this prefix; both halves of the pair carry the
+# ``_autobio_recall`` flag. The flag is the primary signal:
+# structural, not content-heuristic. The prefix is a belt-and-braces
+# fallback for cases where a round-trip drops unknown dict keys.
+_RECALL_HEADER_PREFIX = "[CM] Recall memory "
+_RECALL_FLAG = "_autobio_recall"
 
 
 def render_view(
     store: Store,
     *,
     protect_first_n: int = 1,
+    unfolded_summaries: Optional[Set[str]] = None,
+    # Backwards-compatible alias for callers still passing the old
+    # parameter name. ``unfolded_summaries`` is the canonical name.
     do_not_render_as_marker: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Render the live view from current archive state.
@@ -67,120 +76,152 @@ def render_view(
         store: open Store for the session.
         protect_first_n: number of leading messages to always render
             raw (default 1, the system message).
-        do_not_render_as_marker: optional set of summary ids that
-            should NOT be collapsed to a marker even if they cover
-            a region. The render will instead descend to children.
-            Used by ``UNCOMPRESS`` semantics — once unfolded, a
-            summary stays unfolded until refolded.
+        unfolded_summaries: optional set of L1 IDs that should NOT be
+            collapsed to a recall pair — instead the underlying raw
+            messages are emitted in place. Used by ``UNCOMPRESS``
+            semantics: once unfolded, an L1 stays unfolded until
+            explicitly refolded.
 
     Returns:
-        A list of OpenAI-format message dicts. Tool pairs are
-        sanitized so any orphaned tool_call/result is filtered.
+        A list of OpenAI-format message dicts. Each folded region is
+        represented by a 2-turn recall pair (CM-voice user header +
+        assistant body); raw messages pass through verbatim. Tool
+        pairs are sanitized so any orphaned tool_call/result is
+        filtered.
     """
-    do_not_render_as_marker = set(do_not_render_as_marker or ())
+    if unfolded_summaries is None:
+        unfolded_summaries = set(do_not_render_as_marker or ())
+    else:
+        unfolded_summaries = set(unfolded_summaries)
+        if do_not_render_as_marker:
+            unfolded_summaries |= set(do_not_render_as_marker)
 
     rows = _all_messages(store)
     if not rows:
         return []
 
-    # For every summary in the session, precompute its merge chain so
-    # we can resolve the active marker for each message in O(1).
-    summary_chain = _summary_chain(store)
+    # Per-session summary metadata: id → row dict, for body lookup.
+    by_id = _summary_by_id(store)
 
-    # Walk messages, grouping by active_summary_id.
     out: List[Dict[str, Any]] = []
-    current_marker: Optional[str] = None
-    pending_marker_summary: Optional[Dict[str, Any]] = None
+    current_l1: Optional[str] = None
+    pending_l1_summary: Optional[Dict[str, Any]] = None
+
+    def _flush_pending() -> None:
+        nonlocal current_l1, pending_l1_summary
+        if pending_l1_summary is not None:
+            out.extend(_make_recall_pair(pending_l1_summary))
+        current_l1 = None
+        pending_l1_summary = None
 
     for idx, m in enumerate(rows):
         if idx < protect_first_n:
-            # Always render the head raw.
-            if current_marker is not None and pending_marker_summary is not None:
-                out.append(_make_marker(pending_marker_summary))
-            current_marker = None
-            pending_marker_summary = None
+            _flush_pending()
             out.append(_msg_to_openai(m))
             continue
 
-        active = _active_marker_for(m, summary_chain, do_not_render_as_marker)
-        if active is None:
-            # Flush any pending marker.
-            if current_marker is not None and pending_marker_summary is not None:
-                out.append(_make_marker(pending_marker_summary))
-            current_marker = None
-            pending_marker_summary = None
+        l1_id = m.get("compressed_into")
+        if (
+            not l1_id
+            or l1_id not in by_id
+            or l1_id in unfolded_summaries
+        ):
+            _flush_pending()
             out.append(_msg_to_openai(m))
-        else:
-            if active != current_marker:
-                # Emit the previous marker (if any) before starting a new run.
-                if current_marker is not None and pending_marker_summary is not None:
-                    out.append(_make_marker(pending_marker_summary))
-                current_marker = active
-                pending_marker_summary = summary_chain["by_id"].get(active)
+            continue
 
-    # Flush trailing marker.
-    if current_marker is not None and pending_marker_summary is not None:
-        out.append(_make_marker(pending_marker_summary))
+        # Message is covered by an L1. Group consecutive same-L1
+        # messages so we emit one recall pair per group.
+        if l1_id != current_l1:
+            _flush_pending()
+            current_l1 = l1_id
+            pending_l1_summary = by_id.get(l1_id)
+        # else: same L1 group continues — skip (recall pair pending).
 
+    _flush_pending()
     return _sanitize_tool_pairs(out)
 
 
-def known_marker_hashes(store: Store) -> Set[str]:
-    """Return the set of message hashes that would be produced if every
-    active summary were rendered as a marker right now.
+def known_recall_hashes(store: Store) -> Set[str]:
+    """Hashes of every message that would be emitted as part of a
+    recall pair if the live view were rendered right now.
 
-    The engine uses this to recognize stale markers in input messages
-    (from the runner's prior live state) and skip them on reconcile.
+    The engine uses this to recognize round-tripped recall pair
+    messages in the runner's conversation_history and skip them on
+    reconcile (so a recall pair isn't re-archived as if it were a new
+    conversation turn).
     """
     from .ids import message_hash
-    chain = _summary_chain(store)
+    by_id = _summary_by_id(store)
     out: Set[str] = set()
-    for sid, summary in chain["by_id"].items():
-        marker = _make_marker(summary)
+    for sid, summary in by_id.items():
+        if int(summary.get("level") or 0) != 1:
+            # Recall pairs are emitted for L1 only; L2/L3 are
+            # invisible in the live view (their constituent L1s are
+            # surfaced directly per the balance rule).
+            continue
         try:
-            out.add(message_hash(marker))
+            for piece in _make_recall_pair(summary):
+                out.add(message_hash(piece))
         except Exception:
             pass
     return out
 
 
-def is_marker_message(msg: Dict[str, Any]) -> bool:
-    """True iff ``msg`` is a render-time autobio marker.
+def is_recall_message(msg: Dict[str, Any]) -> bool:
+    """True iff ``msg`` is one half of a render-time recall pair.
 
-    Primary check: the explicit ``_autobio_marker`` flag set by
-    ``_make_marker`` and the compression-layer marker constructor. Any
-    fresh marker from this codebase has the flag.
+    Primary check: the explicit ``_autobio_recall`` flag set on both
+    turns by ``_make_recall_pair``. Any fresh recall pair has the
+    flag.
 
-    Fallback: the ``[autobio:memory `` content prefix. Logged at
-    warning level when it fires alone — the flag should always be
-    present on a fresh marker, so a prefix-only match means the flag
-    was dropped somewhere upstream and the caller should investigate.
+    Fallback: the ``[CM] Recall memory `` content prefix on the
+    header turn. The body turn has no distinctive prefix; if the
+    flag is missing on the body, we cannot reliably recognize it and
+    the warning will fire once on the header to alert the operator
+    that something upstream is stripping unknown dict keys.
     """
     if not isinstance(msg, dict):
         return False
-    if msg.get(_MARKER_FLAG) is True:
+    if msg.get(_RECALL_FLAG) is True:
         return True
 
+    # Prefix fallback (header only).
     content = msg.get("content")
     matched_prefix = False
     if isinstance(content, str):
-        matched_prefix = content.startswith(_MARKER_PREFIX)
+        matched_prefix = content.startswith(_RECALL_HEADER_PREFIX)
     elif isinstance(content, list):
         for blk in content:
             if isinstance(blk, dict) and blk.get("type") == "text":
                 t = blk.get("text") or ""
-                if t.startswith(_MARKER_PREFIX):
+                if t.startswith(_RECALL_HEADER_PREFIX):
                     matched_prefix = True
                 break
     if matched_prefix:
         logger.warning(
-            "autobio: marker recognized by prefix only (no %s flag) — "
-            "investigate upstream caller dropping the flag. content=%r",
-            _MARKER_FLAG,
+            "autobio: recall header recognized by prefix only "
+            "(no %s flag) — investigate upstream caller dropping "
+            "the flag. content=%r",
+            _RECALL_FLAG,
             (content[:80] if isinstance(content, str) else "<list>"),
         )
         return True
     return False
+
+
+# Legacy aliases — kept so external callers (HOOK consumers,
+# experimental engines) that import the old names don't break
+# while we migrate. Will be removed in a follow-up release. The
+# warning mirrors the deprecation pattern used elsewhere.
+def is_marker_message(msg: Dict[str, Any]) -> bool:
+    """Deprecated alias for :func:`is_recall_message`."""
+    return is_recall_message(msg)
+
+
+def known_marker_hashes(store: Store) -> Set[str]:
+    """Deprecated alias for :func:`known_recall_hashes`."""
+    return known_recall_hashes(store)
 
 
 # ---------------------------------------------------------------------------
@@ -198,14 +239,9 @@ def _all_messages(store: Store) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def _summary_chain(store: Store) -> Dict[str, Any]:
-    """Build per-session summary metadata for fast active-marker lookup.
-
-    Returns:
-        {
-          "by_id": { sid: row_dict, ... },
-          "merged_into": { sid: parent_sid_or_None, ... },
-        }
+def _summary_by_id(store: Store) -> Dict[str, Dict[str, Any]]:
+    """Per-session summary metadata, keyed by id. Used to look up the
+    body of an L1 when emitting a recall pair.
     """
     with store._lock:
         rows = store._conn.execute(
@@ -215,84 +251,59 @@ def _summary_chain(store: Store) -> Dict[str, Any]:
             (store.session_id,),
         ).fetchall()
     by_id: Dict[str, Dict[str, Any]] = {}
-    merged_into: Dict[str, Optional[str]] = {}
     for r in rows:
         d = dict(r)
         by_id[d["id"]] = d
-        merged_into[d["id"]] = d.get("merged_into")
-    return {"by_id": by_id, "merged_into": merged_into}
+    return by_id
 
 
-def _active_marker_for(
-    msg_row: Dict[str, Any],
-    chain: Dict[str, Any],
-    do_not_render: Set[str],
-) -> Optional[str]:
-    """Walk the merge chain to find the highest active summary covering
-    this message, skipping any in do_not_render. Returns None if the
-    message isn't covered (still raw L0)."""
-    sid = msg_row.get("compressed_into")
-    if not sid or sid not in chain["by_id"]:
-        return None
-    # Walk upward through merged_into until we hit one whose merged_into
-    # is None (active) or one in do_not_render (descend instead).
-    current = sid
-    last_ok: Optional[str] = None
-    while current is not None:
-        parent = chain["merged_into"].get(current)
-        # Track the last summary that's NOT in do_not_render — that's
-        # what we'd render. If everything up the chain is do_not_render,
-        # we return None (meaning render raw / children).
-        if current not in do_not_render:
-            last_ok = current
-        if parent is None:
-            break
-        current = parent
-    if last_ok is None:
-        # Every level is forced expanded; expose raw messages.
-        return None
-    # If last_ok itself is unfolded, expose raw.
-    if last_ok in do_not_render:
-        return None
-    return last_ok
+def _make_recall_pair(summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build the two-turn dialogue that represents a folded region in
+    the live view.
 
+    Output: ``[header_turn, body_turn]``.
 
-def _make_marker(summary: Dict[str, Any]) -> Dict[str, Any]:
-    """Build the tiny render-time marker for a summary.
+    - **Header turn** (CM-voice user message): tells the agent which
+      memory is being surfaced. Carries the L1's id and generation
+      count so the LLM can refer to them. Text starts with the
+      ``_RECALL_HEADER_PREFIX`` sentinel for prefix-fallback
+      recognition.
+    - **Body turn** (assistant message): the agent's first-person
+      memory content, exactly as the summarizer wrote it.
 
-    ~50 tokens. Carries the id, level, token cost, generation, and a
-    short hint about how to fetch the full content. NOT the full L1
-    body — that lives in the archive and is fetched on demand.
+    Both turns carry the ``_autobio_recall`` flag for structural
+    recognition on round-trip.
 
-    Uses ``role=user`` because the marker is a synthetic header in CM's
-    voice, NOT content produced by the agent. The agent's actual
-    memory body lives in the archive (fetched via cm_manage_context)
-    and would belong in an assistant turn if/when surfaced. Putting
-    the bare structural pointer under ``assistant`` would falsely
-    attribute system metadata to the agent.
+    Role choice rationale:
 
-    The full layout when memories are presented inline (not just as a
-    pointer — see ``_build_kv_preserving_prompt``) is a two-turn
-    dialogue:
+    - Header is in user role: it is NOT produced by the LLM; it is a
+      synthetic CM-voice prompt asking the agent to recall. Putting
+      it under ``assistant`` would falsely attribute system metadata
+      to the agent.
+    - Body is in assistant role: it IS the agent's autobiographical
+      recall (first-person, written by the summarizer). Putting it
+      under ``user`` would tell the model "the user said this
+      happened" rather than "I recall this happening" — a
+      meaningful KV-level distortion.
 
-        user (CM):     Recall memory L1-0042.
-        assistant:     <first-person body>
-
-    The live-view marker is just the header half (no body), since
-    the body sits in the archive until CM expands it.
-
-    The dict carries an explicit ``_autobio_marker`` flag so reconcile
-    paths can recognize markers by schema rather than content prefix.
+    Anthropic dropped the strict role-alternation rule, so
+    consecutive same-role turns concatenate naturally and we don't
+    need any of the workarounds the older marker design carried.
     """
     sid = summary["id"]
-    level = int(summary.get("level", 1))
-    tokens = int(summary.get("tokens", 0) or 0)
     gen = int(summary.get("compression_generations", 1) or 1)
-    body = (
-        f"{_MARKER_PREFIX}{sid} · L{level} · {tokens}t · gen {gen} · "
-        f"call cm_manage_context to expand]"
-    )
-    return {"role": "user", "content": body, _MARKER_FLAG: True}
+    body = summary.get("content") or ""
+    header = {
+        "role": "user",
+        "content": f"{_RECALL_HEADER_PREFIX}{sid} (gen {gen}).",
+        _RECALL_FLAG: True,
+    }
+    body_turn = {
+        "role": "assistant",
+        "content": body,
+        _RECALL_FLAG: True,
+    }
+    return [header, body_turn]
 
 
 def _msg_to_openai(row: Dict[str, Any]) -> Dict[str, Any]:

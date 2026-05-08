@@ -4,8 +4,8 @@ Exercises the four structural changes:
 
 1. **Picker walks archive directly.** A mid-archive coverage gap must
    not produce a chunk that spans it.
-2. **Markers carry an explicit ``_autobio_marker`` flag.** The flag
-   round-trips through render output and ``is_marker_message``
+2. **Recall pairs carry an explicit ``_autobio_recall`` flag.** The
+   flag round-trips through render output and ``is_recall_message``
    recognizes it without falling back to the prefix heuristic.
 3. **Tool-call shape canonical end-to-end.** Stored rows are canonical
    OpenAI form; render passes them through without re-inflation.
@@ -124,31 +124,31 @@ class PickerArchiveWalk(unittest.TestCase):
 # Change 2: marker flag
 # ---------------------------------------------------------------------------
 
-class MarkerFlag(unittest.TestCase):
-    """Markers carry ``_autobio_marker = True`` and are recognized
-    without the prefix fallback firing."""
+class RecallPairFlag(unittest.TestCase):
+    """Both turns of a recall pair carry ``_autobio_recall = True`` and
+    are recognized without the prefix fallback firing."""
 
     def setUp(self) -> None:
         import agent.auxiliary_client  # noqa: F401
-        self.tmp = tempfile.mkdtemp(prefix="autobio_mf_")
+        self.tmp = tempfile.mkdtemp(prefix="autobio_rpf_")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_marker_flag_survives_render_round_trip(self) -> None:
+    def test_recall_flag_survives_render_round_trip(self) -> None:
         """End-to-end: trigger a fold, get the rendered list, verify
-        the marker has the flag, then re-feed the list through
-        ``_reconcile_with_archive`` and verify the marker is skipped
-        (no warning fired about prefix-only recognition).
+        every recall-pair message has the flag, then re-feed the list
+        through ``_reconcile_with_archive`` and verify the recall pair
+        is skipped (no warning fired about prefix-only recognition).
         """
         import logging
 
         from plugins.autobio.engine import AutobioContextEngine
-        from plugins.autobio.render import _MARKER_FLAG, is_marker_message
+        from plugins.autobio.render import _RECALL_FLAG, is_recall_message
 
         eng = AutobioContextEngine()
         eng.update_model(model="t", context_length=100_000)
-        eng.on_session_start("mf", hermes_home=self.tmp)
+        eng.on_session_start("rpf", hermes_home=self.tmp)
         eng.cfg["compression"]["chunk_tokens"] = 4_000
         eng.cfg["compression"]["summary_target_tokens"] = 300
         eng.cfg["compression"]["speculative"] = False
@@ -163,22 +163,39 @@ class MarkerFlag(unittest.TestCase):
                          "content": f"a{i} " + ("y" * 2500)})
 
         with patch("agent.auxiliary_client.call_llm",
-                   return_value=_resp("memory")):
+                   return_value=_resp("memory body")):
             rendered = eng.compress(msgs)
 
-        # Find the marker(s) in the rendered output.
-        markers = [m for m in rendered if is_marker_message(m)]
+        # Find recall-pair messages in the rendered output. Pairs come
+        # in adjacent (header, body) couples — both should carry the
+        # flag.
+        recall_msgs = [m for m in rendered if is_recall_message(m)]
         self.assertGreater(
-            len(markers), 0, "compress() should have produced a marker",
+            len(recall_msgs), 0,
+            "compress() should have produced at least one recall pair",
         )
-        for m in markers:
+        # Pairs come in 2s.
+        self.assertEqual(
+            len(recall_msgs) % 2, 0,
+            f"recall messages should pair up; got odd count {len(recall_msgs)}",
+        )
+        for m in recall_msgs:
             self.assertIs(
-                m.get(_MARKER_FLAG), True,
-                f"marker missing {_MARKER_FLAG} flag: {m}",
+                m.get(_RECALL_FLAG), True,
+                f"recall message missing {_RECALL_FLAG} flag: {m}",
+            )
+        # Verify the alternation: even-indexed are user headers,
+        # odd-indexed are assistant bodies.
+        for i, m in enumerate(recall_msgs):
+            expected = "user" if i % 2 == 0 else "assistant"
+            self.assertEqual(
+                m.get("role"), expected,
+                f"recall pair role mismatch at idx {i}: expected "
+                f"{expected}, got {m.get('role')}",
             )
 
-        # Re-feed the rendered list. The reconcile path should skip
-        # markers without firing the prefix-fallback warning.
+        # Re-feed the rendered list. Reconcile should skip recall
+        # messages without firing the prefix-fallback warning.
         autobio_logger = logging.getLogger("plugins.autobio.render")
         captured: List[logging.LogRecord] = []
 
@@ -195,7 +212,7 @@ class MarkerFlag(unittest.TestCase):
 
         prefix_fallback = [
             r for r in captured
-            if "marker recognized by prefix only" in r.getMessage()
+            if "prefix only" in r.getMessage()
         ]
         self.assertEqual(
             prefix_fallback, [],
@@ -203,22 +220,21 @@ class MarkerFlag(unittest.TestCase):
             "(flag should have been the primary signal)",
         )
 
-        eng.on_session_end("mf", [])
+        eng.on_session_end("rpf", [])
 
-    def test_prefix_fallback_fires_on_flagless_marker(self) -> None:
-        """If a caller hand-builds a marker without the flag (or the
-        flag was stripped during a JSON round-trip), the prefix
-        fallback should still recognize it AND log a warning so the
-        gap is investigable.
+    def test_prefix_fallback_fires_on_flagless_recall_header(self) -> None:
+        """If a caller hand-builds a recall header without the flag
+        (or the flag was stripped during a JSON round-trip), the
+        prefix fallback should still recognize it AND log a warning
+        so the gap is investigable.
         """
         import logging
 
-        from plugins.autobio.render import is_marker_message
+        from plugins.autobio.render import is_recall_message
 
         flagless = {
             "role": "user",
-            "content": "[autobio:memory L1-0001 · L1 · 200t · gen 1 · "
-                       "call cm_manage_context to expand]",
+            "content": "[CM] Recall memory L1-0001 (gen 1).",
         }
 
         autobio_logger = logging.getLogger("plugins.autobio.render")
@@ -231,12 +247,14 @@ class MarkerFlag(unittest.TestCase):
         cap = _Capture(level=logging.WARNING)
         autobio_logger.addHandler(cap)
         try:
-            recognized = is_marker_message(flagless)
+            recognized = is_recall_message(flagless)
         finally:
             autobio_logger.removeHandler(cap)
 
-        self.assertTrue(recognized,
-                        "prefix fallback should still recognize the marker")
+        self.assertTrue(
+            recognized,
+            "prefix fallback should still recognize the recall header",
+        )
         self.assertTrue(
             any("prefix only" in r.getMessage() for r in captured),
             "expected a warning about prefix-only recognition",
@@ -686,24 +704,48 @@ class AgentOriginRoleHonesty(unittest.TestCase):
     same-role turns are fine — we don't need workarounds.
     """
 
-    def test_render_marker_is_user_role_header(self) -> None:
-        """The live-view marker is a header-only artifact (the body
-        lives in the archive). Headers are CM-voice, so user role.
+    def test_render_recall_pair_role_split(self) -> None:
+        """A recall pair has the header in user role (CM-voice) and
+        the body in assistant role (the agent's first-person memory).
         """
-        from plugins.autobio.render import _make_marker
-        marker = _make_marker({
+        from plugins.autobio.render import _make_recall_pair
+        pair = _make_recall_pair({
             "id": "L1-0001", "level": 1, "tokens": 800,
-            "compression_generations": 1, "content": "x",
+            "compression_generations": 1,
+            "content": "I remember reading the spec carefully.",
         })
+        self.assertEqual(len(pair), 2,
+                         "recall pair should have exactly 2 turns")
+        header, body = pair
         self.assertEqual(
-            marker.get("role"), "user",
-            "live-view marker is a header from CM, not agent recall",
+            header.get("role"), "user",
+            "recall header is CM-voice — must be user role",
+        )
+        self.assertIn("Recall memory L1-0001", header.get("content"))
+        self.assertEqual(
+            body.get("role"), "assistant",
+            "recall body is agent-origin first-person — must be "
+            "assistant role",
+        )
+        self.assertEqual(
+            body.get("content"), "I remember reading the spec carefully.",
+            "body content must match the L1's recall verbatim",
         )
 
-    def test_legacy_summary_marker_is_user_role_header(self) -> None:
-        from plugins.autobio.compression import _make_summary_marker
-        marker = _make_summary_marker("L1-0042", "memory body", level=1)
-        self.assertEqual(marker.get("role"), "user")
+    def test_legacy_compression_recall_pair_role_split(self) -> None:
+        """The legacy ``compression._make_recall_pair`` (used by the
+        list-based ``fold_chunk``) emits the same header/body shape
+        as ``render._make_recall_pair``."""
+        from plugins.autobio.compression import _make_recall_pair
+        pair = _make_recall_pair({
+            "id": "L1-0042",
+            "compression_generations": 1,
+            "content": "memory body content",
+        })
+        self.assertEqual(len(pair), 2)
+        self.assertEqual(pair[0].get("role"), "user")
+        self.assertEqual(pair[1].get("role"), "assistant")
+        self.assertEqual(pair[1].get("content"), "memory body content")
 
     def test_summarizer_prompt_uses_dialogue_pattern(self) -> None:
         """Prior summaries shown to the summarizer must be split into

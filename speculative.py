@@ -154,7 +154,7 @@ class SpeculativeWorker:
         in unit tests that instantiate SpeculativeWorker directly).
         Mirrors engine._reconcile_with_archive minimally.
         """
-        from .render import is_marker_message
+        from .render import is_recall_message
         with self._store._lock:
             row = self._store._conn.execute(
                 "SELECT COALESCE(MAX(position), -1) FROM messages "
@@ -163,7 +163,7 @@ class SpeculativeWorker:
             ).fetchone()
         next_pos = (row[0] if row else -1) + 1
         for msg in messages:
-            if is_marker_message(msg):
+            if is_recall_message(msg):
                 continue
             try:
                 h = message_hash(msg)
