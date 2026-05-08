@@ -1349,5 +1349,132 @@ class SummarizerPromptComposition(unittest.TestCase):
         close_store(self.tmp, "skeleton")
 
 
+class MainLlmCallRecording(unittest.TestCase):
+    """The autobio engine implements ``ContextEngine.on_llm_call`` to
+    record the main agent's per-call request/response into the
+    archive's ``llm_calls`` table. Without this, the viewer can only
+    show plugin-internal LLM calls (summarizer/merge/CM); main-agent
+    prompts — the actual memory-context rendering surface — would
+    have nowhere to land for inspection.
+    """
+
+    def setUp(self) -> None:
+        import agent.auxiliary_client  # noqa: F401
+        self.tmp = tempfile.mkdtemp(prefix="autobio_mlc_")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_records_openai_shape_response(self) -> None:
+        from plugins.autobio.engine import AutobioContextEngine
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="haiku-4-5", context_length=200_000)
+        eng.on_session_start("mlc1", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        api_kwargs = {
+            "model": "anthropic/claude-haiku-4-5",
+            "messages": [
+                {"role": "user", "content": "[CM] Recall memory L1-0001 (gen 1)."},
+                {"role": "assistant", "content": "I remember reading the spec."},
+                {"role": "user", "content": "and now: please pick a number"},
+            ],
+            "max_tokens": 100,
+        }
+        # OpenAI-shape mock response.
+        response = MagicMock()
+        choice = MagicMock()
+        choice.message.content = "I pick 7."
+        choice.finish_reason = "stop"
+        response.choices = [choice]
+        response.usage = MagicMock(
+            prompt_tokens=2400, completion_tokens=8,
+        )
+
+        eng.on_llm_call(api_kwargs, response)
+
+        calls = eng._store.list_llm_calls()
+        main_calls = [c for c in calls if c["purpose"] == "main"]
+        self.assertEqual(len(main_calls), 1)
+        c = main_calls[0]
+        self.assertEqual(c["model"], "anthropic/claude-haiku-4-5")
+        self.assertEqual(c["response_text"], "I pick 7.")
+        self.assertEqual(c["response_finish"], "stop")
+        self.assertEqual(c["prompt_tokens"], 2400)
+        self.assertEqual(c["completion_tokens"], 8)
+
+        # The prompt is preserved verbatim.
+        prompt = json.loads(c["prompt_json"])
+        self.assertEqual(len(prompt), 3)
+        self.assertIn("Recall memory L1-0001", prompt[0]["content"])
+
+        eng.on_session_end("mlc1", [])
+
+    def test_records_anthropic_native_shape(self) -> None:
+        from plugins.autobio.engine import AutobioContextEngine
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="claude", context_length=200_000)
+        eng.on_session_start("mlc2", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        api_kwargs = {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        # Anthropic-native shape: content is a list of blocks, usage
+        # uses input_tokens / output_tokens, finish via stop_reason.
+        response = MagicMock(spec=["content", "stop_reason", "usage"])
+        block = MagicMock(spec=["text"])
+        block.text = "hello there"
+        response.content = [block]
+        response.stop_reason = "end_turn"
+        response.usage = MagicMock(spec=["input_tokens", "output_tokens"])
+        response.usage.input_tokens = 50
+        response.usage.output_tokens = 3
+
+        eng.on_llm_call(api_kwargs, response)
+
+        calls = eng._store.list_llm_calls()
+        main_calls = [c for c in calls if c["purpose"] == "main"]
+        self.assertEqual(len(main_calls), 1)
+        c = main_calls[0]
+        self.assertEqual(c["response_text"], "hello there")
+        self.assertEqual(c["response_finish"], "end_turn")
+        self.assertEqual(c["prompt_tokens"], 50)
+        self.assertEqual(c["completion_tokens"], 3)
+
+        eng.on_session_end("mlc2", [])
+
+    def test_records_failed_call_with_error(self) -> None:
+        from plugins.autobio.engine import AutobioContextEngine
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="any", context_length=200_000)
+        eng.on_session_start("mlc3", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        api_kwargs = {
+            "model": "x", "messages": [{"role": "user", "content": "go"}],
+        }
+        eng.on_llm_call(
+            api_kwargs, response=None,
+            error=RuntimeError("rate limited"),
+        )
+
+        calls = eng._store.list_llm_calls()
+        main_calls = [c for c in calls if c["purpose"] == "main"]
+        self.assertEqual(len(main_calls), 1)
+        c = main_calls[0]
+        self.assertIsNone(c["response_text"])
+        self.assertIn("rate limited", c["error"])
+
+        eng.on_session_end("mlc3", [])
+
+
 if __name__ == "__main__":
     unittest.main()

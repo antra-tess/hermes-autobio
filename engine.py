@@ -484,6 +484,111 @@ class AutobioContextEngine(ContextEngine):
         if injected is not None:
             messages.append(injected)
 
+    # -- per-call hook --------------------------------------------------
+
+    def on_llm_call(
+        self,
+        api_kwargs: Dict[str, Any],
+        response: Any = None,
+        *,
+        error: Optional[Exception] = None,
+    ) -> None:
+        """Record the main agent's per-call request/response into the
+        ``llm_calls`` archive table so the viewer can show exactly
+        what prompt the agent saw on each turn.
+
+        Without this, the viewer's LLM-call records cover only
+        plugin-internal calls (summarizer / merge / CM); the main
+        agent's actual prompts — which is where memory-context
+        rendering matters most — are not persisted anywhere
+        inspectable. With it, every model call shows up under
+        ``purpose="main"`` with full prompt + response.
+
+        Provider-shape handling: OpenAI-compatible responses expose
+        ``choices[0].message.content``; Anthropic native exposes
+        ``content[N].text``; Bedrock converse is normalized to the
+        OpenAI shape upstream. We try OpenAI first, then fall back
+        to Anthropic blocks.
+        """
+        if self._store is None:
+            return
+        try:
+            messages = api_kwargs.get("messages") or []
+            model = (
+                api_kwargs.get("model")
+                or self.model
+                or "unknown"
+            )
+
+            if response is None or error is not None:
+                self._store.record_llm_call(
+                    purpose="main",
+                    prompt_messages=messages,
+                    response_text=None,
+                    model=model,
+                    error=str(error) if error else "no response",
+                )
+                return
+
+            response_text: Optional[str] = None
+            finish_reason: Optional[str] = None
+
+            choices = getattr(response, "choices", None)
+            if choices:
+                try:
+                    choice = choices[0]
+                    msg = getattr(choice, "message", None)
+                    if msg is not None:
+                        response_text = getattr(msg, "content", None) or ""
+                    finish_reason = getattr(choice, "finish_reason", None)
+                except (AttributeError, IndexError):
+                    pass
+
+            if response_text is None:
+                # Anthropic native: response.content is a list of blocks
+                # (text / tool_use / thinking / …). Concatenate text.
+                content_blocks = getattr(response, "content", None)
+                if content_blocks:
+                    pieces: List[str] = []
+                    for blk in content_blocks:
+                        text = getattr(blk, "text", None)
+                        if text:
+                            pieces.append(text)
+                    response_text = "\n".join(pieces) if pieces else ""
+                stop_reason = getattr(response, "stop_reason", None)
+                if stop_reason:
+                    finish_reason = str(stop_reason)
+
+            usage = getattr(response, "usage", None)
+            prompt_tokens: Optional[int] = None
+            completion_tokens: Optional[int] = None
+            if usage is not None:
+                pt = (
+                    getattr(usage, "prompt_tokens", None)
+                    or getattr(usage, "input_tokens", None)
+                )
+                ct = (
+                    getattr(usage, "completion_tokens", None)
+                    or getattr(usage, "output_tokens", None)
+                )
+                try:
+                    prompt_tokens = int(pt) if pt is not None else None
+                    completion_tokens = int(ct) if ct is not None else None
+                except (TypeError, ValueError):
+                    pass
+
+            self._store.record_llm_call(
+                purpose="main",
+                prompt_messages=messages,
+                response_text=response_text,
+                model=str(model),
+                response_finish=str(finish_reason) if finish_reason else None,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+        except Exception as e:
+            logger.warning("autobio on_llm_call recording failed: %s", e)
+
     # -- tool schemas ---------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:

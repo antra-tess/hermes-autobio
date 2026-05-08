@@ -1,10 +1,13 @@
-# Required hermes-agent patch
+# Required hermes-agent patches
 
-The autobio plugin needs **one** framework hook in hermes-agent:
-`ContextEngine.on_turn_end(messages)`. Without it, engines have no
-per-turn visibility into the live message list — `compress()` only
-fires on threshold, and `update_from_response` runs per API call
-(including mid-tool-loop iterations) with no messages.
+The autobio plugin needs **two** framework hooks in hermes-agent:
+``ContextEngine.on_turn_end(messages)`` and
+``ContextEngine.on_llm_call(api_kwargs, response, *, error=None)``.
+Without them, the engine has no per-turn visibility into the live
+message list AND no per-call visibility into the prompt/response
+the agent actually saw.
+
+## Hook 1 — `on_turn_end(messages)`
 
 The autobio engine uses `on_turn_end` for two features:
 
@@ -51,6 +54,67 @@ except Exception as _engine_err:
 ```
 
 That's the entire framework change. Five lines plus a docstring.
+
+## Hook 2 — `on_llm_call(api_kwargs, response, *, error=None)`
+
+The autobio engine uses ``on_llm_call`` to record every main-agent
+LLM call into the archive's ``llm_calls`` table. Without it, the
+viewer's LLM-call records cover only plugin-internal calls
+(summarizer, merge, CM); the main agent's actual prompts — which
+is where memory-context rendering matters most — would have nowhere
+to land for inspection.
+
+### `agent/context_engine.py` — add the ABC method
+
+```python
+def on_llm_call(
+    self,
+    api_kwargs: Dict[str, Any],
+    response: Any = None,
+    *,
+    error: Optional[Exception] = None,
+) -> None:
+    """Called once per LLM API call after the call returns.
+
+    ``api_kwargs`` is the exact kwargs that went to the provider
+    client (chat.completions.create / messages.create / bedrock
+    converse). ``response`` is the provider's response object
+    (None on failure; ``error`` carries the exception).
+
+    Fires for every API call regardless of tool-loop iteration —
+    one user turn produces N invocations of this hook for N
+    tool-chained model calls. Default no-op; runner swallows
+    hook errors.
+    """
+```
+
+### `run_agent.py` — call it after each API response
+
+In the main API-dispatch loop, immediately after the call returns
+and before validation:
+
+```python
+if _use_streaming:
+    response = self._interruptible_streaming_api_call(
+        api_kwargs, on_first_delta=_stop_spinner
+    )
+else:
+    response = self._interruptible_api_call(api_kwargs)
+
+_engine = getattr(self, "context_compressor", None)
+if _engine is not None and response is not None:
+    try:
+        _engine.on_llm_call(api_kwargs, response)
+    except Exception as _engine_err:
+        logger.debug(
+            "context engine on_llm_call failed: %s",
+            _engine_err,
+        )
+
+api_duration = time.time() - api_start_time
+```
+
+That's the second framework change. About ten lines.
 
 ## Backward compatibility
 
