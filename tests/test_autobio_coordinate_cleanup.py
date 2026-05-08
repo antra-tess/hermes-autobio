@@ -1804,5 +1804,92 @@ class UncompressRefoldRoundTrip(unittest.TestCase):
         eng.on_session_end("uf3", [])
 
 
+class DashboardScope(unittest.TestCase):
+    """The L1 row of CM's dashboard must include merged L1s so CM can
+    UNCOMPRESS / REFOLD / PIN any L1 currently in the agent's prompt.
+    Under the balance rule, render emits a recall pair for every L1
+    in the archive — active OR merged into a parent.
+    """
+
+    def setUp(self) -> None:
+        import agent.auxiliary_client  # noqa: F401
+        self.tmp = tempfile.mkdtemp(prefix="autobio_dash_")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_l1_dashboard_includes_merged(self) -> None:
+        from plugins.autobio.cm import build_dashboard
+        from plugins.autobio.engine import AutobioContextEngine
+        from plugins.autobio.ids import message_hash
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="t", context_length=100_000)
+        eng.on_session_start("dash", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        # Insert 12 messages, fold into 2 L1s of 6 each, then merge
+        # into a single L2.
+        for i in range(12):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role, "content": f"m{i}"}
+            eng._store.upsert_message(message_hash(m), m, turn=i, position=i)
+
+        l1_ids = []
+        for k in range(2):
+            hashes = []
+            for j in range(6):
+                pos = k * 6 + j
+                role = "user" if pos % 2 == 0 else "assistant"
+                hashes.append(message_hash({"role": role, "content": f"m{pos}"}))
+            sid = eng._store.insert_summary(
+                level=1, source_hashes=hashes, source_hash=f"sh-{k}",
+                content=f"chunk-{k} recall body",
+                tokens=80, compression_generations=1,
+            )
+            eng._store.mark_compressed(hashes, sid)
+            l1_ids.append(sid)
+
+        # Merge both L1s into an L2.
+        l2_id = eng._store.insert_summary(
+            level=2, source_hashes=l1_ids, source_hash="l2-sh",
+            content="L2 consolidating chunks 0+1.",
+            tokens=120, compression_generations=2,
+        )
+        eng._store.mark_summary_merged(l1_ids, l2_id)
+
+        # Sanity: list_summaries(level=1, include_merged=False) is
+        # empty (both L1s merged); the active layer count is 0 → 1
+        # L2 active.
+        self.assertEqual(
+            eng._store.list_summaries(1, include_merged=False), [],
+        )
+        self.assertEqual(
+            len(eng._store.list_summaries(2, include_merged=False)), 1,
+        )
+
+        # Dashboard must still surface the merged L1s in the l1 row.
+        dashboard = build_dashboard(eng, messages=[])
+        l1_layer = dashboard["layers"]["l1"]
+        self.assertEqual(
+            l1_layer["count"], 2,
+            f"l1 dashboard count should include merged L1s; got "
+            f"{l1_layer}",
+        )
+        recent_ids = [p["id"] for p in l1_layer["recent"]]
+        for sid in l1_ids:
+            self.assertIn(
+                sid, recent_ids,
+                f"merged L1 {sid} missing from dashboard previews",
+            )
+
+        # L2 stays active-only (the merged L1s above are L1, not L2).
+        # If we ever merge L2→L3, only the active L2 should show in
+        # l2.count — verify by reading the count.
+        self.assertEqual(dashboard["layers"]["l2"]["count"], 1)
+        eng.on_session_end("dash", [])
+
+
 if __name__ == "__main__":
     unittest.main()

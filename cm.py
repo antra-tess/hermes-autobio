@@ -334,7 +334,27 @@ def build_dashboard(
     layer_counts = store.summary_counts() if store else {}
     layers: Dict[str, Dict[str, Any]] = {}
     for level in (1, 2, 3):
-        summaries = store.list_summaries(level, include_merged=False) if store else []
+        # L1 dashboard scope = what render emits. Under the
+        # balance rule, ``render_view`` walks ``messages.compressed
+        # _into`` directly and emits a recall pair for every L1 the
+        # archive contains — active OR merged_into a parent. CM
+        # needs to see the same set so it can UNCOMPRESS / REFOLD /
+        # PIN any L1 the agent currently has in its live view.
+        # If we filter to active-only here, an L1 that's been rolled
+        # up into an L2 disappears from the dashboard while still
+        # appearing in the agent's prompt, and CM responds "L1-X
+        # doesn't exist" to a perfectly valid request.
+        #
+        # L2/L3 stay active-only because they aren't directly
+        # rendered in the live view (the balance rule expands them
+        # to their L1 children). Listing merged L2/L3 in the
+        # dashboard would just inflate counts without giving CM a
+        # handle on anything actually in the prompt.
+        include_merged_for_level = (level == 1)
+        summaries = (
+            store.list_summaries(level, include_merged=include_merged_for_level)
+            if store else []
+        )
         # Include first ~200 chars of each summary so CM can answer
         # directly from the dashboard when possible, instead of guessing
         # from counts and then being contradicted by its own SEARCH op.
