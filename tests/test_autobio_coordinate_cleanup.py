@@ -1476,5 +1476,135 @@ class MainLlmCallRecording(unittest.TestCase):
         eng.on_session_end("mlc3", [])
 
 
+class CmModelProviderResolution(unittest.TestCase):
+    """The CM model name needs to match the resolved auxiliary
+    provider. Bare ``claude-sonnet-4-6`` works on direct Anthropic
+    but OpenRouter requires the ``anthropic/claude-sonnet-4-6``
+    namespace. The autobio engine should normalize on the fly so the
+    same default config works for both deployments.
+    """
+
+    def setUp(self) -> None:
+        import agent.auxiliary_client  # noqa: F401
+        self.tmp = tempfile.mkdtemp(prefix="autobio_cm_provider_")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_engine(self, *, base_url: str, provider: str):
+        from plugins.autobio.engine import AutobioContextEngine
+        eng = AutobioContextEngine()
+        eng.update_model(
+            model="anthropic/claude-haiku-4-5",
+            context_length=200_000,
+            base_url=base_url,
+            api_key="test-key",
+            provider=provider,
+            api_mode="openai",
+        )
+        eng.cfg["compression"]["speculative"] = False
+        eng.on_session_start("cm_prov", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+        return eng
+
+    def test_bare_claude_name_namespaced_for_openrouter(self) -> None:
+        from plugins.autobio.cm import _resolve_cm_model_for_provider
+        eng = self._make_engine(
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+        )
+        try:
+            cfg = {"model": "claude-sonnet-4-6"}
+            self.assertEqual(
+                _resolve_cm_model_for_provider(cfg, eng),
+                "anthropic/claude-sonnet-4-6",
+            )
+            cfg = {"model": "claude-haiku-4-5"}
+            self.assertEqual(
+                _resolve_cm_model_for_provider(cfg, eng),
+                "anthropic/claude-haiku-4-5",
+            )
+        finally:
+            eng.on_session_end("cm_prov", [])
+
+    def test_bare_claude_name_left_alone_for_anthropic_direct(self) -> None:
+        from plugins.autobio.cm import _resolve_cm_model_for_provider
+        eng = self._make_engine(
+            base_url="https://api.anthropic.com",
+            provider="anthropic",
+        )
+        try:
+            cfg = {"model": "claude-sonnet-4-6"}
+            self.assertEqual(
+                _resolve_cm_model_for_provider(cfg, eng),
+                "claude-sonnet-4-6",
+            )
+        finally:
+            eng.on_session_end("cm_prov", [])
+
+    def test_already_namespaced_passes_through(self) -> None:
+        from plugins.autobio.cm import _resolve_cm_model_for_provider
+        # Even on Anthropic-direct, an explicitly namespaced value
+        # is honored verbatim (the user picked it on purpose).
+        eng = self._make_engine(
+            base_url="https://api.anthropic.com",
+            provider="anthropic",
+        )
+        try:
+            cfg = {"model": "anthropic/claude-sonnet-4-6"}
+            self.assertEqual(
+                _resolve_cm_model_for_provider(cfg, eng),
+                "anthropic/claude-sonnet-4-6",
+            )
+            cfg = {"model": "openai/gpt-4o-mini"}
+            self.assertEqual(
+                _resolve_cm_model_for_provider(cfg, eng),
+                "openai/gpt-4o-mini",
+            )
+        finally:
+            eng.on_session_end("cm_prov", [])
+
+    def test_non_claude_bare_name_passes_through(self) -> None:
+        """The normalization is narrow — it only adjusts bare
+        ``claude-*`` names. Other bare names are left alone (the
+        adapter has no opinion on their correct namespacing)."""
+        from plugins.autobio.cm import _resolve_cm_model_for_provider
+        eng = self._make_engine(
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+        )
+        try:
+            cfg = {"model": "gpt-4o-mini"}
+            self.assertEqual(
+                _resolve_cm_model_for_provider(cfg, eng),
+                "gpt-4o-mini",
+            )
+            cfg = {"model": "deepseek-chat"}
+            self.assertEqual(
+                _resolve_cm_model_for_provider(cfg, eng),
+                "deepseek-chat",
+            )
+        finally:
+            eng.on_session_end("cm_prov", [])
+
+    def test_empty_or_none_passes_through(self) -> None:
+        from plugins.autobio.cm import _resolve_cm_model_for_provider
+        eng = self._make_engine(
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+        )
+        try:
+            self.assertIsNone(_resolve_cm_model_for_provider({}, eng))
+            self.assertIsNone(
+                _resolve_cm_model_for_provider({"model": None}, eng),
+            )
+            self.assertEqual(
+                _resolve_cm_model_for_provider({"model": ""}, eng), "",
+            )
+        finally:
+            eng.on_session_end("cm_prov", [])
+
+
 if __name__ == "__main__":
     unittest.main()

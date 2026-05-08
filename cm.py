@@ -415,6 +415,45 @@ def _build_cm_prompt(
     ]
 
 
+def _resolve_cm_model_for_provider(
+    cm_cfg: Dict[str, Any],
+    engine: "AutobioContextEngine",
+) -> Optional[str]:
+    """Return the CM model name in the form the resolved auxiliary
+    provider expects.
+
+    The default ``cm.model`` (``"claude-sonnet-4-6"``) is the bare
+    Anthropic identifier — correct for the direct Anthropic API but
+    rejected by OpenRouter, which expects the namespaced form
+    (``"anthropic/claude-sonnet-4-6"``). We detect the active
+    inference provider from the engine's runtime context and
+    normalize on the fly so the same default works for both
+    OpenRouter and direct-Anthropic deployments.
+
+    Heuristics (intentionally narrow — only adjust bare ``claude-*``):
+
+    - Already namespaced (contains ``/``): leave alone. The user
+      knows what they want; we don't second-guess.
+    - Provider is OpenRouter (provider name match or base_url
+      contains ``openrouter.ai``) AND the model is a bare
+      ``claude-*`` name: prepend ``anthropic/``.
+    - Otherwise: pass through unchanged. Direct Anthropic, Nous
+      Portal, gateway, or anything else takes the configured value.
+    """
+    raw = cm_cfg.get("model")
+    if not raw or not isinstance(raw, str):
+        return raw
+    if "/" in raw:
+        return raw
+    if not raw.startswith("claude-"):
+        return raw
+    base_url = (engine.base_url or "").lower()
+    provider = (engine.provider or "").lower()
+    if "openrouter.ai" in base_url or provider == "openrouter":
+        return f"anthropic/{raw}"
+    return raw
+
+
 def _call_cm(
     messages: List[Dict[str, str]],
     engine: "AutobioContextEngine",
@@ -444,6 +483,7 @@ def _call_cm(
         return ("", None)
 
     cm_cfg = engine.cfg.get("cm", {})
+    resolved_cm_model = _resolve_cm_model_for_provider(cm_cfg, engine)
     call_kwargs: Dict[str, Any] = {
         "task": "compression",  # reuse auxiliary.compression provider config
         "messages": messages,
@@ -454,8 +494,8 @@ def _call_cm(
             "api_mode": engine.api_mode,
         },
     }
-    if cm_cfg.get("model"):
-        call_kwargs["model"] = cm_cfg["model"]
+    if resolved_cm_model:
+        call_kwargs["model"] = resolved_cm_model
 
     response_text = ""
     finish_reason: Optional[str] = None
@@ -483,7 +523,10 @@ def _call_cm(
             call_id = engine._store.record_llm_call(
                 purpose=purpose, prompt_messages=messages,
                 response_text=response_text or None,
-                model=cm_cfg.get("model") or engine.model,
+                # Record the actual sent model name (provider-normalized)
+                # rather than the bare config value, so the viewer
+                # reflects what the API saw.
+                model=resolved_cm_model or engine.model,
                 response_finish=finish_reason,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
