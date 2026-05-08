@@ -1891,6 +1891,147 @@ class DashboardScope(unittest.TestCase):
         eng.on_session_end("dash", [])
 
 
+class L3MergeFormation(unittest.TestCase):
+    """L2→L3 merge path is structurally identical to L1→L2 but takes
+    a long conversation to exercise naturally (6 L2s = 36+ L1s with
+    default merge_threshold=6). We use merge_threshold=2 to drive it
+    in a small synthetic.
+
+    Verifies:
+
+    1. ``merge_if_ready`` runs L1→L2 then L2→L3 in the same call.
+    2. The resulting L3 has source_hashes pointing at the L2s, which
+       in turn have source_hashes pointing at the L1s, which point at
+       message hashes — full chain back to source.
+    3. compression_generations climbs (1 → 2 → 3) per level.
+    4. Render still emits L1 recall pairs for the messages whose L1
+       was rolled into an L2 then an L3 (balance rule: lower orbitals
+       first, regardless of how high the merge tower climbs).
+    """
+
+    def setUp(self) -> None:
+        import agent.auxiliary_client  # noqa: F401
+        self.tmp = tempfile.mkdtemp(prefix="autobio_l3_")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_l3_forms_from_4_l1s_with_threshold_2(self) -> None:
+        from plugins.autobio.compression import merge_if_ready, ModelInfo
+        from plugins.autobio.engine import AutobioContextEngine
+        from plugins.autobio.ids import message_hash
+
+        eng = AutobioContextEngine()
+        eng.update_model(model="t", context_length=100_000)
+        eng.on_session_start("l3", hermes_home=self.tmp)
+        if eng._speculative is not None:
+            eng._speculative._enabled = False
+
+        # Insert 16 messages and 4 L1s of 4 messages each, position-
+        # contiguous. Default threshold=2 will: pair the L1s into 2
+        # L2s, then pair those L2s into 1 L3 — all in one merge_if_ready
+        # call (the function loops L1→L2 to exhaustion, then L2→L3).
+        N_MESSAGES = 16
+        L1_COUNT = 4
+        MSGS_PER_L1 = N_MESSAGES // L1_COUNT
+
+        for i in range(N_MESSAGES):
+            role = "user" if i % 2 == 0 else "assistant"
+            m = {"role": role, "content": f"m{i}"}
+            eng._store.upsert_message(message_hash(m), m, turn=i, position=i)
+
+        l1_ids = []
+        for k in range(L1_COUNT):
+            hashes = []
+            for j in range(MSGS_PER_L1):
+                pos = k * MSGS_PER_L1 + j
+                role = "user" if pos % 2 == 0 else "assistant"
+                hashes.append(message_hash({"role": role, "content": f"m{pos}"}))
+            sid = eng._store.insert_summary(
+                level=1, source_hashes=hashes, source_hash=f"l1-sh-{k}",
+                content=f"L1 chunk {k} body",
+                tokens=40, compression_generations=1,
+            )
+            eng._store.mark_compressed(hashes, sid)
+            l1_ids.append(sid)
+
+        eng.cfg["compression"]["merge_threshold"] = 2
+        eng.cfg["compression"]["summary_target_tokens"] = 100
+        model_info = ModelInfo(model="t")
+
+        # Stub the auxiliary so merges return non-empty content.
+        with patch("agent.auxiliary_client.call_llm",
+                   return_value=_resp("merged content")):
+            created = merge_if_ready(eng._store, eng.cfg, model_info)
+
+        # Expected: 2 L2s + 1 L3 created.
+        l2s = eng._store.list_summaries(level=2, include_merged=True)
+        l3s = eng._store.list_summaries(level=3, include_merged=True)
+        self.assertEqual(
+            len(l2s), 2,
+            f"expected 2 L2s after L1→L2; got {[s['id'] for s in l2s]}",
+        )
+        self.assertEqual(
+            len(l3s), 1,
+            f"expected 1 L3 after L2→L3; got {[s['id'] for s in l3s]}",
+        )
+        self.assertEqual(
+            len(created), 3,
+            f"merge_if_ready should report 3 new summaries; got {created}",
+        )
+
+        # Active layers: L1s all merged; L2s all merged; one active L3.
+        self.assertEqual(
+            eng._store.list_summaries(1, include_merged=False), [],
+        )
+        self.assertEqual(
+            eng._store.list_summaries(2, include_merged=False), [],
+        )
+        active_l3 = eng._store.list_summaries(3, include_merged=False)
+        self.assertEqual(len(active_l3), 1)
+
+        l3 = l3s[0]
+        # source_hashes on L3 → L2 ids (its direct children).
+        l3_children = json.loads(l3["source_hashes"])
+        self.assertEqual(
+            sorted(l3_children),
+            sorted(s["id"] for s in l2s),
+            f"L3 children should be the two L2s; got {l3_children}",
+        )
+
+        # Walk one L2's source_hashes → should be L1 ids.
+        l2_a = l2s[0]
+        l2_a_children = json.loads(l2_a["source_hashes"])
+        self.assertEqual(len(l2_a_children), 2)
+        for child in l2_a_children:
+            self.assertTrue(
+                child.startswith("L1-"),
+                f"L2 children should be L1 ids; got {child}",
+            )
+
+        # compression_generations: 1 (L1) → 2 (L2) → 3 (L3).
+        self.assertEqual(int(l3["compression_generations"]), 3)
+        self.assertEqual(int(l2_a["compression_generations"]), 2)
+
+        # Balance rule: render still emits L1 recall pairs for the
+        # messages whose L1 was rolled into an L2 then an L3 — render
+        # walks compressed_into directly, so it always emits L1
+        # fidelity regardless of how high the merge tower climbs.
+        from plugins.autobio.render import render_view
+        rendered = render_view(eng._store, protect_first_n=0)
+        # Every L1 should produce a recall pair (header + body = 2 msgs).
+        from plugins.autobio.render import is_recall_message
+        recall_msgs = [m for m in rendered if is_recall_message(m)]
+        self.assertEqual(
+            len(recall_msgs), L1_COUNT * 2,
+            f"balance rule: render should emit one L1 recall pair per "
+            f"L1 ({L1_COUNT} pairs = {L1_COUNT * 2} msgs); got "
+            f"{len(recall_msgs)} from rendered list of {len(rendered)}",
+        )
+
+        eng.on_session_end("l3", [])
+
+
 class CrashResilience(unittest.TestCase):
     """Archive must remain consistent across an unclean shutdown.
 
