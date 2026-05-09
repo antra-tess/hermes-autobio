@@ -96,11 +96,23 @@ singleton. The two plugin directories each contain a thin
 `register(ctx)` shim; the real code lives in the sibling package
 `plugins/autobio/` so both halves can import from it.
 
-One framework hook was added to Hermes itself: `ContextEngine.on_turn_end(messages)`.
-Without it, engines have no per-turn visibility into the live message
-list — compression's existing hooks only fire on threshold. The
-autobio engine uses `on_turn_end` for speculation timing and
-proactive CM check-ins. See the Hermes Interface Mapping section.
+Four small framework changes upstream in hermes-agent:
+
+- `ContextEngine.on_turn_end(messages)` — per-turn message-list
+  visibility for speculative scheduling + proactive CM.
+- `ContextEngine.on_llm_call(api_kwargs, response, *, error)` —
+  per-call hook for recording the main agent's exact prompt/response.
+- Engine-driven preflight via `should_compress_preflight(messages)`,
+  consulted by the runner alongside the length guard. Lets
+  transfer-in surface recall pairs on resume even when the live
+  message list is short.
+- System-prompt tuning knobs (`agent.skip_default_identity` plus
+  guidance overrides for memory / session_search / skills) so the
+  agent's prompt assembly can defer to autobio's recall mechanism
+  instead of fighting the default Hermes identity layer.
+
+All four are backward-compatible (no-op defaults). See the Hermes
+Interface Mapping section, and `HERMES_PATCH.md` for full diffs.
 
 ---
 
@@ -335,6 +347,33 @@ the tail and crowded out everything else. Under the new model, the
 archive grows as usual; only the display is locked. When pressure
 eventually forces the pin to release (or relax from L0 to L1), the
 summary is already waiting.
+
+#### Range-pin vs. summary-pin
+
+Two distinct things in the schema both got called "pin." Disambiguate:
+
+- **Range-pin** lives in the `pins` table (`kind='pin'`). Covers a
+  span of message hashes. Read by compression's fold-protection logic
+  to keep raw messages from being folded. Exercised by fuzz scenarios
+  via direct `add_pin(... kind='pin')` calls. **Live and used.**
+  Currently no CM op exposes range-pin creation directly — only
+  document pins (`kind='doc_*'`) get a CM-facing op via
+  `MARK_DOCUMENT`. Range-pin support is a hook for future CM ops or
+  programmatic protection of specific spans.
+
+- **Summary-pin** is the `summaries.pinned` boolean column. Was
+  intended to protect a specific L1/L2 from being merged into a
+  parent. **Vestigial under v1**: the balance rule means render
+  always emits L1 recall pairs regardless of merge state, so the
+  flag has no observable effect. The CM ops that read/write it
+  (`PIN <id>` / `UNPIN <id>`) are not exposed in v1 (see CM
+  Operations section). The column and op handlers are kept in the
+  codebase but return an explanatory error so a CM that hallucinates
+  the op from training data gets a clear signal. Re-introduced in
+  v2 when adaptive resolution lets pinning actually keep a region
+  at higher fidelity than its merge state would dictate.
+
+When this doc says "pin" without qualification it means **range-pin**.
 
 ### Documents
 
@@ -593,22 +632,34 @@ directly when the dashboard already has the answer.
 
 ### CM Operations
 
-| Op                  | Effect                                            |
-|---------------------|---------------------------------------------------|
-| `SEARCH "q"`        | FTS5 hybrid search over summaries + messages      |
-| `GREP "pat"`        | Raw text grep across summary markdown on disk     |
-| `UNCOMPRESS <id>`   | Unfold an L1/L2/L3 back into source content       |
-| `PIN <id>`          | Protect a summary from merging                    |
-| `UNPIN <id>`        | Remove pin                                        |
-| `MARK_DOCUMENT ...` | Register a protected range as a document (planned)|
-| `MERGE <level>`     | Force a merge pass at a level                     |
-| `SET_INTERVAL <N>`  | Change proactive check-in frequency               |
-| `DEFER <N>`         | Skip this check-in, reschedule N turns ahead      |
+| Op                       | Effect                                                            |
+|--------------------------|-------------------------------------------------------------------|
+| `SEARCH "q"`             | FTS5 hybrid search over summaries + messages                      |
+| `GREP "pat"`              | Raw text grep across summary markdown on disk                    |
+| `UNCOMPRESS <id>`        | Render `<id>`'s source as raw messages in the live view, AND inline the expansion in the op result so the main instance sees it now. The unfolded state persists across renders (stored in the `unfolded_summaries` KV) until explicitly refolded |
+| `REFOLD <id>`            | Inverse of UNCOMPRESS: revert the live view to showing `<id>` as a recall pair instead of raw messages |
+| `MARK_DOCUMENT <s> <e> [style] [title]` | Register a protected range as a document (style: `chronological` or `monolithic`) |
+| `LIST_DOCUMENTS`         | Enumerate active documents with progress (chunks folded vs. remaining) |
+| `UNMARK_DOCUMENT <pin>`  | Retire a document pin; content stays archived                     |
+| `MERGE <level>`          | Force a merge pass at the given level (usually automatic)         |
+| `SET_INTERVAL <N>`       | Change CM's proactive check-in frequency                          |
+| `DEFER <N> "reason"`     | Skip this check-in, reschedule `N` turns ahead                    |
+| `RESUME_COMPRESSION`     | Clear a halt flag set when the summarizer returned empty after retries (use only after the underlying cause has been addressed) |
 
 Notably **absent**: a way to compress arbitrary middle ranges. CM
 does not direct the compression schedule — compression is always
 chronological. CM directs **display resolution**: which layer to
-render a region at, which ranges to protect, which to unfold.
+render a region at, which ranges to unfold, which ranges to protect
+as documents.
+
+**Deferred**: summary-level `PIN <id>` / `UNPIN <id>`. The
+``summaries.pinned`` column exists, but under the v1 balance rule
+``render_view`` walks ``messages.compressed_into`` directly and emits
+a recall pair for every L1 (active or merged) regardless of pin
+state — so summary-level pinning has no observable effect on the
+agent's prompt. Re-introduced in v2 when adaptive resolution makes
+merge-state actually control render fidelity. For range-level
+protection of raw messages, use `MARK_DOCUMENT` instead.
 
 ### Op ordering rule
 
@@ -771,12 +822,30 @@ class AutobioContextEngine(ContextEngine):
     def should_compress(self, prompt_tokens):
         # Fire when tail exceeds configured threshold
 
-    def compress(self, messages, current_tokens=None):
-        # Archive-first, then prune, then compress_step orchestrator
+    def should_compress_preflight(self, messages):
+        # Engine-driven preflight: always fire when memory exists in
+        # the archive, regardless of message count. Lets transfer-in
+        # surface recall pairs on the first turn even when the live
+        # list is short.
+
+    def compress(self, messages, current_tokens=None, **kwargs):
+        # Archive-first, then prune, then compress_step orchestrator.
+        # **kwargs absorbs runner-passed extras (e.g., focus_topic)
+        # so ContextEngine API additions don't break us.
 
     def on_turn_end(self, messages):
-        # NEW Hermes hook. Per-turn visibility into the live list.
-        # Used for speculative scheduling + proactive CM check-in.
+        # Hermes ABC hook (new in autobio). Per-turn visibility into
+        # the live list. Used for speculative scheduling + proactive
+        # CM check-in.
+
+    def on_llm_call(self, api_kwargs, response, *, error=None):
+        # Hermes ABC hook (new in autobio). Records the main agent's
+        # exact prompt + response into the ``llm_calls`` table with
+        # ``purpose="main"``. Handles OpenAI, Anthropic-native, and
+        # streaming-reconstructed response shapes. Without this, the
+        # viewer would only show plugin-internal LLM calls and the
+        # main agent's prompts — the actual memory-context rendering
+        # surface — would have nowhere to land for inspection.
 
     def get_tool_schemas(self):
         # Expose cm_manage_context tool
@@ -814,7 +883,14 @@ class AutobioMemoryProvider(MemoryProvider):
         # FTS indexing happens on archive writes; no-op here
 ```
 
-### The on_turn_end hook
+### Framework changes in hermes-agent
+
+Autobio needs four small framework changes upstream. All are
+backward-compatible: the built-in compressor and any third-party
+engine inherit no-op defaults and are unaffected. Full diffs in
+`HERMES_PATCH.md`.
+
+#### 1. `on_turn_end(messages)` — per-turn message-list visibility
 
 The base `ContextEngine` previously had no hook that fires per-turn
 with full message-list visibility. `compress()` only runs on
@@ -824,24 +900,97 @@ the wrong granularity.
 
 Without a per-turn hook, two features break:
 
-1. **Speculative timing**. Speculation should fire when the tail is
-   growing toward threshold. That's a per-turn decision with access to
-   the live list. Without the hook, speculation can only be scheduled
-   from inside `compress()` itself — which by definition runs too late.
-2. **Proactive CM**. CM's check-in decision depends on recent turn
-   content. Without message-list visibility, CM would operate on
-   counts alone, or observations would have to queue and surface
+1. **Speculative timing.** Speculation should fire when the tail is
+   growing toward threshold. That's a per-turn decision with access
+   to the live list. Without the hook, speculation can only be
+   scheduled from inside `compress()` itself — which by definition
+   runs too late.
+2. **Proactive CM check-ins.** CM's check-in decision depends on
+   recent turn content. Without message-list visibility, CM would
+   operate on counts alone, or observations would queue and surface
    lazily later.
 
-We added `on_turn_end(messages)` to the ABC with a no-op default. The
-call site in `run_agent.py` fires it after the tool loop exits and
-the final response is committed, guarded by try/except. The built-in
-compressor ignores it (default no-op); the autobio engine uses it
-for both features above.
+We added `on_turn_end(messages)` to the ABC with a no-op default.
+The call site in `run_agent.py` fires it after the tool loop exits
+and the final response is committed, guarded by try/except.
+
+#### 2. `on_llm_call(api_kwargs, response, *, error=None)` — per-call audit
+
+Without this hook, the only LLM calls landing in the archive's
+`llm_calls` table are plugin-internal ones (summarizer, merge, CM
+responses). The main agent's actual prompts — which is precisely
+where memory-context rendering matters most — have nowhere to land
+for inspection.
+
+The hook fires once per API call (so N invocations per user turn for
+an N-step tool chain) immediately after the response returns, with
+the exact api_kwargs that went to the provider. The autobio engine
+records each call as `purpose="main"` and handles three response
+shapes: OpenAI-compatible (`response.choices[0].message.content`),
+Anthropic-native (`response.content[N].text` blocks, skipping
+non-text blocks like thinking/tool_use), and streaming-reconstructed
+(SimpleNamespace mimicking the non-streaming shape upstream in the
+runner). Streaming and direct-Anthropic paths are covered by
+SimpleNamespace-based shape tests rather than MagicMock to catch
+missing-attr assumptions.
+
+#### 3. Engine-driven preflight via `should_compress_preflight(messages)`
+
+The runner's preflight-compress check at session-resume time used to
+be gated on a length guard:
+
+```python
+if (self.compression_enabled
+    and len(messages) > protect_first_n + protect_last_n + 1):
+    ...token threshold check...
+```
+
+For autobio transfer-in (session resumed with seeded memory in the
+archive but only 1–2 short messages in `conversation_history`), the
+length guard skipped the block entirely and the engine never got a
+chance to render its memory recall pairs into conversation_history
+before the first API call. Result: the agent's first turn after
+transfer-in saw no memory at all.
+
+Fix: runner consults `engine.should_compress_preflight(messages)`
+alongside the length guard and bypasses both guards when the engine
+fires. The base ContextEngine returns False by default (preserves
+existing behavior). Autobio returns True whenever any L1 exists in
+the archive — guarantees the first preflight after resume renders
+recall pairs into the live list.
+
+#### 4. System-prompt tuning knobs
+
+The default Hermes system prompt carries a "You are Hermes Agent…"
+identity layer plus tool-guidance blocks (`MEMORY_GUIDANCE`,
+`SESSION_SEARCH_GUIDANCE`, `SKILLS_GUIDANCE`). For autobio
+deployments — especially when transferring in an agent whose
+identity should come from its accumulated memory — those defaults
+fight the intent. The `MEMORY_GUIDANCE` block in particular
+references a memory subsystem that autobio replaces.
+
+Three additions to `_build_system_prompt` and `agent.*` config:
+
+- `agent.skip_default_identity: bool` — skip the SOUL.md /
+  DEFAULT_AGENT_IDENTITY block. When set, the runner also passes
+  `skip_soul=True` to `build_context_files_prompt` so SOUL.md
+  doesn't sneak back in via the context-files path.
+- `agent.memory_guidance: str` — empty string suppresses the
+  default memory guidance block; non-empty replaces verbatim;
+  unset keeps default.
+- `agent.session_search_guidance: str` — same shape as above.
+- `agent.skills_guidance: str` — same shape as above.
+
+All gated on the corresponding tool being loaded. Empty-string
+suppression is the autobio-recommended default for the three
+guidance blocks.
 
 ---
 
 ## Configuration
+
+Defaults that match `plugins/autobio/config.py` as of v1. Anything not
+specified in `~/.hermes/config.yaml` falls back to these values.
 
 ```yaml
 context:
@@ -850,30 +999,87 @@ context:
 memory:
   provider: autobio
 
-autobio:
-  tail:
-    default_tokens: 100000
-    min_tokens: 50000
-    max_tokens: 150000
+# --- agent-level system-prompt knobs (read by run_agent.py) ---
+# These live under ``agent:``, NOT ``autobio:``, because they apply to
+# the main agent's prompt assembly regardless of which context engine
+# is active. They become essential for autobio because the default
+# identity + memory-tool guidance assumes a memory subsystem autobio
+# replaces.
+agent:
+  skip_default_identity: true   # skip "You are Hermes Agent…" + SOUL.md
+  memory_guidance: ""           # suppress (autobio handles memory)
+  session_search_guidance: ""   # suppress (autobio's archive search supersedes)
+  skills_guidance: ""           # suppress / customize per deployment
 
+# --- autobio-specific config ---
+autobio:
   compression:
-    chunk_tokens: 10000
+    # Weighted-token budget the picker accumulates per L1 chunk. Lower
+    # values produce more, smaller, denser L1s (faster L2/L3 hierarchy
+    # formation, more granular memory recall); higher values produce
+    # fewer, coarser L1s. 6k weighted tokens lands ~10 L1s per
+    # 250k-token tool-heavy session.
+    chunk_tokens: 6000
     summary_target_tokens: 2500
     merge_threshold: 6
     max_levels: 3
     speculative: true
+    speculative_lead_tokens: 20000
+    summarize_retries: 3              # retry empty summarizer output
+    # Optional: cap summarizer max_tokens directly. When unset, autobio
+    # uses summary_target_tokens * 1.4. Reasoning models that consume
+    # hidden completion tokens (k2.6, o1) may need a larger cap.
+    # max_tokens_override: 6000
+
+    # Weighted chunk sizing. Not all tokens cost the same in memory
+    # terms: code/console output is recoverable from disk (CM can
+    # re-read or grep), so it gets a discount; user/assistant text is
+    # irreplaceable and counts at full weight. The chunk picker
+    # accumulates WEIGHTED tokens up to ``chunk_tokens``.
+    #
+    # Weights apply ONLY to chunk-budget accounting. Threshold (when
+    # to fire compress) and auto-doc detection stay raw — they're
+    # about real model context limits.
+    weights:
+      default: 1.0
+      user: 1.0
+      assistant: 1.0
+      system: 1.0
+      tool_default: 0.5             # most tools (search, MCP, web fetch)
+      tool_by_name:
+        # Code reads / console output: cheap to recover.
+        Read: 0.1
+        Bash: 0.1
+        Grep: 0.1
+        Glob: 0.1
+        terminal: 0.1
+        read_file: 0.1
+        # Document reads (extension-tagged): full content matters.
+        # ``Read:ext`` form is set at archive time by tool_naming.
+        # enrich_tool_name and takes precedence over the bare name.
+        "Read:md": 0.5
+        "Read:rst": 0.5
+        "Read:txt": 0.5
+        "Read:org": 0.5
+        # Web — partial recovery.
+        WebFetch: 0.5
+        WebSearch: 0.5
 
   cm:
+    # Bare ``claude-sonnet-4-6`` works on direct Anthropic API; the
+    # provider-aware resolver namespaces it as
+    # ``anthropic/claude-sonnet-4-6`` for OpenRouter automatically.
     model: "claude-sonnet-4-6"
     context_length: 1000000
     checkin_interval: 50
     forgetting_confirmation: false
-    contradiction_detection: false   # deferred v2
-    proactive_surfacing: false       # deferred v2
+    contradiction_detection: false    # deferred to v2
+    proactive_surfacing: false        # deferred to v2
     defer_during_tool_chains: true
 
   search:
     max_results: 6
+    min_score: 0.0
     # Embeddings deferred — FTS5 + grep only for v1.
 
   tool_pruning:
@@ -882,21 +1088,32 @@ autobio:
       summary_min_chars: 200
       argument_truncate_chars: 500
     per_tool:
-      terminal:   { full_retention_tokens: 50000 }
-      read_file:  { full_retention_tokens: 15000 }
-      write_file: { argument_truncate_chars: 200 }
+      terminal:       { full_retention_tokens: 50000 }
+      read_file:      { full_retention_tokens: 15000 }
+      memory_search:  { full_retention_tokens: 10000 }
+      write_file:     { argument_truncate_chars: 200 }
     dedup: true
 
-  documents:                         # planned
+  documents:
     auto_detect: true
     auto_threshold_tokens: 50000
     auto_style: chronological
-    eligibility: size_pressure
+    eligibility: size_pressure        # or 'manual'
     snap_boundary_window_tokens: 500
+    exclude_tools: []                 # tool names that never auto-mark
 
   store:
-    subdir: memory/autobio
+    subdir: memory/autobio            # relative to hermes_home
 ```
+
+### Config orphans (declared but not read)
+
+The DEFAULTS dict carries a `tail` block (`default_tokens`,
+`min_tokens`, `max_tokens`) reserved for an adaptive-tail feature
+that didn't ship in v1. Currently no code path reads these keys; the
+tail boundary is computed from the picker's `protect_last_tokens`
+parameter inside compression. Setting them in user config has no
+effect. Slated for cleanup or wiring in v2.
 
 ---
 
@@ -942,9 +1159,9 @@ wrong.
 
 We cut it. Compression is strictly chronological (oldest uncompressed
 chunk first). CM's role is **display resolution**, not compression
-schedule. The ops CM has — fold, unfold, pin, mark_document — control
-what layer renders where in the live view. The archive's growth
-pattern is driven by tail pressure, not CM whim.
+schedule. The ops CM has — `UNCOMPRESS`, `REFOLD`, `MARK_DOCUMENT` —
+control what layer renders where in the live view. The archive's
+growth pattern is driven by tail pressure, not CM whim.
 
 ### Why not: pin blocks compression (write lock)
 
@@ -1056,26 +1273,66 @@ is nonetheless in context is weaker than just not putting it there.
 
 - Plugin skeleton (both ContextEngine and MemoryProvider halves)
 - SQLite archive with content-hash message IDs, FTS5
+  (content hash includes `reasoning_details` so thinking-only turns
+  don't collapse to identical hashes)
 - Three-pass tool-result pruning with per-tool retention
 - `summarize_chunk` / `fold_chunk` / `unfold` / `compress_step`
 - L1→L2→L3 merging at configurable thresholds
+  (L3 path verified end-to-end with synthetic merge_threshold=2)
 - Speculative summarization via archive-dedup
+- Recall-pair dialogue rendering (CM-voice user header + agent-voice
+  body) — replaces the earlier single-marker design
+- Balance rule: render walks `messages.compressed_into` directly so
+  every L1 emits a recall pair regardless of merge state above it
+- `UNCOMPRESS` / `REFOLD` ops with persistence in the
+  `unfolded_summaries` KV (state survives across renders until
+  explicitly refolded)
+- `MARK_DOCUMENT` / `LIST_DOCUMENTS` / `UNMARK_DOCUMENT` ops with
+  document folding (chronological + monolithic styles)
 - CM as tool (`cm_manage_context`) with op parser
-- Dashboard with summary previews
+- Dashboard with summary previews (L1 row includes merged-into-L2 L1s
+  so CM can act on anything currently in the agent's prompt)
 - Proactive CM check-ins (in-dialog via `on_turn_end`)
+- Provider-aware CM model resolution (bare `claude-sonnet-4-6`
+  namespaced to `anthropic/claude-sonnet-4-6` on OpenRouter)
 - FTS5 + grep search
-- The `on_turn_end` framework hook in Hermes ABC + run_agent.py
-- 18 passing mock tests + gated live API tests
+- Four framework changes upstream in hermes-agent:
+  `on_turn_end`, `on_llm_call`, `should_compress_preflight`,
+  system-prompt tuning knobs
+- Main-agent prompt audit trail in `llm_calls` table with
+  `purpose=main` (records exact prompt + response on every API call;
+  handles OpenAI, Anthropic-native, and streaming-reconstructed
+  shapes)
+- Transfer-in workflow: resume a session with seeded memory; first
+  preflight renders recall pairs into conversation_history before
+  the first API call
+- Crash resilience: orphan-summary recovery via
+  `find_summary_by_source_hash` content-addressed dedup. Verified
+  with both synthetic injection and a real subprocess SIGKILL
+  mid-compress
+- 40 passing mock tests covering the above
 
 **Deferred to v2:**
 
-- Documents (pins with kind=`doc_chronological|monolithic`) — plan ready
-- Embeddings for semantic search — interface point reserved
-- Contradiction detection (depends on embeddings)
-- Proactive surfacing (topic pattern tracking)
-- Forgetting confirmation
-- Catastrophic recovery from archive
-- Recursive CM spawning for deep research across many layers
+- **Adaptive resolution** per region (when budget tight, fall back
+  from L1-fidelity rendering to L2/L3 representations — what the
+  balance rule's "lower orbitals first" wording leaves room for).
+  This is the structural prerequisite for re-exposing summary-level
+  PIN/UNPIN.
+- **Summary-level PIN / UNPIN** ops — the `summaries.pinned` column
+  and op handlers exist but are gated off in v1 (op handler returns
+  an explanatory error). Re-introduced once adaptive resolution
+  makes the flag observable.
+- **Embeddings** for semantic search — interface point reserved
+- **Contradiction detection** (depends on embeddings)
+- **Proactive surfacing** (topic pattern tracking)
+- **Forgetting confirmation**
+- **Catastrophic recovery** from archive (the archive is durable
+  under SQLite WAL; what's deferred is a higher-level workflow for
+  reconstructing a session entirely from archive when the live
+  conversation_history is lost)
+- **Recursive CM spawning** for deep research across many layers
+- **Multi-user / per-user topic tracking** in gateway sessions
 
 ---
 
