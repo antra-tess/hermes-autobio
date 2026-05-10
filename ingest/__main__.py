@@ -24,11 +24,13 @@ import sys
 from pathlib import Path
 
 from ..store import close_store, get_store
+from .arc_request_log import ArcRequestLogAdapter
 from .claude_code import ClaudeCodeAdapter
 from .seed import seed_archive
 
 _ADAPTERS = {
     "claude_code": ClaudeCodeAdapter,
+    "arc_request_log": ArcRequestLogAdapter,
 }
 
 
@@ -48,6 +50,16 @@ def main() -> int:
                     default=True)
     ap.add_argument("--no-system-reminders", action="store_false",
                     dest="include_system_reminders")
+    ap.add_argument("--final-assistant-text", default=None,
+                    help=("[arc_request_log only] Append a synthetic "
+                          "assistant turn with this text after the request "
+                          "log ends. Use when the log captured a prompt "
+                          "and you want the archive to also include the "
+                          "reply that prompt produced."))
+    ap.add_argument("--final-assistant-text-file", type=Path, default=None,
+                    help=("[arc_request_log only] Same as "
+                          "--final-assistant-text but read from a file. "
+                          "Useful for multiline replies."))
     ap.add_argument("--raise-on-failure", action="store_true",
                     help="Halt on the first upsert failure (default: continue).")
     ap.add_argument("--verbose", "-v", action="store_true")
@@ -69,6 +81,19 @@ def main() -> int:
     }
     if args.source == "claude_code":
         adapter_kwargs["include_system_reminders"] = args.include_system_reminders
+    elif args.source == "arc_request_log":
+        cap_text = args.final_assistant_text
+        if args.final_assistant_text_file is not None:
+            if cap_text is not None:
+                print(
+                    "ERROR: pass either --final-assistant-text or "
+                    "--final-assistant-text-file, not both",
+                    file=sys.stderr,
+                )
+                return 2
+            cap_text = args.final_assistant_text_file.read_text(encoding="utf-8")
+        if cap_text is not None:
+            adapter_kwargs["final_assistant_text"] = cap_text
 
     adapter = adapter_cls(**adapter_kwargs)
 

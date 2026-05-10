@@ -17,6 +17,7 @@ Public API:
 
 from __future__ import annotations
 
+from .arc_request_log import ArcRequestLogAdapter
 from .base import IngestedMessage, TranscriptAdapter
 from .claude_code import ClaudeCodeAdapter
 from .redact import redact_message, redact_text
@@ -26,6 +27,7 @@ __all__ = [
     "IngestedMessage",
     "TranscriptAdapter",
     "ClaudeCodeAdapter",
+    "ArcRequestLogAdapter",
     "seed_archive",
     "SeedResult",
     "redact_text",
