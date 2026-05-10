@@ -112,9 +112,30 @@ class AutobioContextEngine(ContextEngine):
             int(context_length * self.threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
+        # Clamp protect_last_tokens against the model's actual
+        # threshold. Reserving most of the threshold as raw tail
+        # leaves the chunk picker with no room to fold under
+        # pressure. Cap at threshold/3, which preserves the
+        # production default's tail-to-threshold ratio (250k/750k =
+        # 1/3 on a 1M model) and degrades sanely on smaller models —
+        # e.g., tests using 100k context get clamped to ~25k tail
+        # rather than nullifying the picker.
+        compression_cfg = self.cfg.setdefault("compression", {})
+        cfg_plt = compression_cfg.get("protect_last_tokens")
+        if cfg_plt is not None:
+            cap = max(self.threshold_tokens // 3, 0)
+            if int(cfg_plt) > cap > 0:
+                logger.warning(
+                    "autobio: protect_last_tokens=%d exceeds threshold/3=%d "
+                    "for context_length=%d (threshold=%d); clamping.",
+                    cfg_plt, cap, context_length, self.threshold_tokens,
+                )
+                compression_cfg["protect_last_tokens"] = cap
         logger.info(
-            "autobio engine: model=%s context_length=%d threshold=%d",
+            "autobio engine: model=%s context_length=%d threshold=%d "
+            "protect_last_tokens=%s",
             model, context_length, self.threshold_tokens,
+            compression_cfg.get("protect_last_tokens"),
         )
 
     # -- compression gate ------------------------------------------------
@@ -168,11 +189,23 @@ class AutobioContextEngine(ContextEngine):
         ):
             return True
 
-        # Always fire when there's memory to keep the rendered view
-        # in sync with archive state (UNCOMPRESS toggles, new L1s,
-        # transfer-in seeding).
-        if self._store is not None and self._store.summary_counts():
-            return True
+        # Fire when archive state has anything the runner's
+        # conversation_history doesn't reflect. Two cases:
+        #
+        # 1. Summaries / folds exist — render must surface them as
+        #    recall pairs; UNCOMPRESS toggles must take effect.
+        # 2. Transfer-in: raw archive seeded out-of-band (e.g., via
+        #    the ingest CLI) but conversation_history is still empty
+        #    or partial. Without this check, the agent boots with no
+        #    context on the first turn. compress() then runs render-
+        #    only (the pressure gate skips fold for no-pressure
+        #    transfer-in cases), populating conversation_history
+        #    from the archive before the first API call.
+        if self._store is not None:
+            if self._store.summary_counts():
+                return True
+            if self._store.message_count() > len(messages):
+                return True
 
         return False
 
@@ -199,13 +232,19 @@ class AutobioContextEngine(ContextEngine):
         current_tokens: Optional[int] = None,
         **kwargs: Any,  # absorb runner-side hints (focus_topic, etc.)
     ) -> List[Dict[str, Any]]:
-        """Archive-first, then prune, then run a compression step
-        (summarize + fold), then promote L1→L2→L3 if merge thresholds
-        are met. Finally schedule speculation for the next compression.
+        """Archive-first, then prune, then maybe fold a chunk (only
+        under genuine pressure), then re-render. Finally schedule
+        speculation.
 
-        The speculative worker may have already written an L1 to the
-        archive for the current chunk; compress_step picks it up via
-        source_hash lookup without a second LLM call.
+        The fold step (``compress_step_archive`` + ``merge_if_ready``)
+        only runs when the rendered view's token estimate is at or
+        above the configured threshold. Preflight may fire for several
+        non-pressure reasons — transfer-in, UNCOMPRESS toggle, newly-
+        speculated L1s in the archive — but in those cases we want to
+        *re-render* the live view from current archive state without
+        also inventing a new fold. Folding is reserved for "we're
+        actually about to overflow context," not "compress() got
+        called for any reason."
         """
         from .compression import (
             ModelInfo, SummarizationFailed, compress_step_archive,
@@ -255,18 +294,34 @@ class AutobioContextEngine(ContextEngine):
             api_mode=self.api_mode,
         )
 
-        # Step 3: archive-only compression. compress_step_archive picks
-        # a chunk of UNCOVERED messages from the archive (not from a
-        # live list), summarizes, and marks them covered. No live-list
-        # mutation.
+        # Step 3: archive-only compression — gated on actual pressure.
+        # The picker can always *find* a chunk if there's content past
+        # the protect_last_tokens tail, but folding when the live view
+        # is comfortably below threshold disturbs KV state for no
+        # reason. Only fold when the rendered+pruned view is at or
+        # above threshold. merge_if_ready is gated together because
+        # promoting speculative-only L1s into L2s breaks the source-
+        # hash cache (find_summary_by_source_hash filters merged L1s).
+        from agent.model_metadata import estimate_messages_tokens_rough
+        view_tokens = estimate_messages_tokens_rough(pruned)
+        under_pressure = (
+            self.threshold_tokens > 0
+            and view_tokens >= self.threshold_tokens
+        )
         try:
-            compress_step_archive(
-                self._store, self.cfg, model_info,
-                protect_first_n=self.protect_first_n,
-            )
-            merged = merge_if_ready(self._store, self.cfg, model_info)
-            if merged:
-                logger.info("autobio merged: %s", merged)
+            if under_pressure:
+                compress_step_archive(
+                    self._store, self.cfg, model_info,
+                    protect_first_n=self.protect_first_n,
+                )
+                merged = merge_if_ready(self._store, self.cfg, model_info)
+                if merged:
+                    logger.info("autobio merged: %s", merged)
+            else:
+                logger.debug(
+                    "autobio compress: render-only (view=%d < threshold=%d)",
+                    view_tokens, self.threshold_tokens,
+                )
         except SummarizationFailed as failure:
             # Halt. Do NOT fabricate a placeholder — the archive is
             # authoritative and every summary must be a real memory the

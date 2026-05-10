@@ -425,7 +425,9 @@ def compress_step(
     chunk_token_target = int(compression_cfg.get("chunk_tokens", 10_000))
 
     if protect_last_tokens is None:
-        protect_last_tokens = chunk_token_target * 2
+        protect_last_tokens = int(compression_cfg.get(
+            "protect_last_tokens", chunk_token_target * 2,
+        ))
 
     # Resolve protected ranges against the live view.
     live_hashes = [message_hash(m) for m in messages]
@@ -555,7 +557,9 @@ def compress_step_archive(
     compression_cfg = cfg.get("compression", {})
     chunk_token_target = int(compression_cfg.get("chunk_tokens", 10_000))
     if protect_last_tokens is None:
-        protect_last_tokens = chunk_token_target * 2
+        protect_last_tokens = int(compression_cfg.get(
+            "protect_last_tokens", chunk_token_target * 2,
+        ))
     weights_cfg = compression_cfg.get("weights")
     doc_policy = (cfg.get("documents") or {}).get("eligibility", "size_pressure")
 

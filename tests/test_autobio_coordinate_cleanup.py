@@ -154,6 +154,8 @@ class RecallPairFlag(unittest.TestCase):
         eng.cfg["compression"]["speculative"] = False
         if eng._speculative is not None:
             eng._speculative._enabled = False
+        # Force pressure on a small synthetic corpus.
+        eng.threshold_tokens = 1_000
 
         msgs: List[Dict[str, Any]] = [{"role": "system", "content": "sys"}]
         for i in range(30):
@@ -2250,6 +2252,8 @@ class CrashResilience(unittest.TestCase):
         eng.cfg["compression"]["speculative"] = False
         if eng._speculative is not None:
             eng._speculative._enabled = False
+        # Force pressure on a small synthetic corpus.
+        eng.threshold_tokens = 1_000
 
         msgs = self._make_msgs()
 
@@ -2343,6 +2347,8 @@ class CrashResilience(unittest.TestCase):
         eng_a.cfg["compression"]["speculative"] = False
         if eng_a._speculative is not None:
             eng_a._speculative._enabled = False
+        # Force pressure on a small synthetic corpus.
+        eng_a.threshold_tokens = 1_000
 
         store_a = eng_a._store
         original_mark = store_a.mark_compressed
@@ -2379,6 +2385,8 @@ class CrashResilience(unittest.TestCase):
         eng_b.cfg["compression"]["chunk_tokens"] = 4_000
         eng_b.cfg["compression"]["summary_target_tokens"] = 300
         eng_b.cfg["compression"]["speculative"] = False
+        # Force pressure on a small synthetic corpus.
+        eng_b.threshold_tokens = 1_000
         if eng_b._speculative is not None:
             eng_b._speculative._enabled = False
 

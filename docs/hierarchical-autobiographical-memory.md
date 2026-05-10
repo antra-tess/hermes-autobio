@@ -1020,11 +1020,21 @@ autobio:
     # fewer, coarser L1s. 6k weighted tokens lands ~10 L1s per
     # 250k-token tool-heavy session.
     chunk_tokens: 6000
+    # Tokens of recent raw conversation the picker MUST leave at the
+    # live tail. Sized for an agent whose working memory at any moment
+    # includes the recent ~250k of conversation; tune lower for short
+    # tool-heavy sessions, higher for long-narrative ones.
+    protect_last_tokens: 250000
     summary_target_tokens: 2500
     merge_threshold: 6
     max_levels: 3
     speculative: true
     speculative_lead_tokens: 20000
+    # Cap on unmerged L1s the speculative worker is allowed to
+    # accumulate in the archive. Prevents a freshly-seeded archive
+    # from burning summarizer calls to pre-warm L1s that may never
+    # be needed. ~1 L3 worth.
+    max_speculative_l1s: 36
     summarize_retries: 3              # retry empty summarizer output
     # Optional: cap summarizer max_tokens directly. When unset, autobio
     # uses summary_target_tokens * 1.4. Reasoning models that consume
@@ -1105,15 +1115,6 @@ autobio:
   store:
     subdir: memory/autobio            # relative to hermes_home
 ```
-
-### Config orphans (declared but not read)
-
-The DEFAULTS dict carries a `tail` block (`default_tokens`,
-`min_tokens`, `max_tokens`) reserved for an adaptive-tail feature
-that didn't ship in v1. Currently no code path reads these keys; the
-tail boundary is computed from the picker's `protect_last_tokens`
-parameter inside compression. Setting them in user config has no
-effect. Slated for cleanup or wiring in v2.
 
 ---
 

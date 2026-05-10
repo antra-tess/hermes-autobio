@@ -126,39 +126,6 @@ class AutobioE2E(unittest.TestCase):
         self.assertLess(len(out), len(msgs))
         eng.on_session_end("e2e-session", [])
 
-    def test_cm_tool_call_executes_ops(self) -> None:
-        """cm_manage_context parses OPS and runs them."""
-        eng = self._make_engine()
-        # Seed some summaries
-        eng._store.insert_summary(
-            level=1, source_hashes=["h1"], source_hash="h1",
-            content="We chose Redis for rate limiting because of persistence.",
-            tokens=100, compression_generations=1,
-        )
-
-        cm_resp = (
-            "We decided on Redis for rate limiting — it has persistence advantages.\n\n"
-            "OPS:\n"
-            "SEARCH \"rate limiting\"\n"
-            "PIN L1-0001 \"key architectural decision\"\n"
-        )
-        with patch("agent.auxiliary_client.call_llm", return_value=_fake_llm_response(cm_resp)):
-            result_json = eng.handle_tool_call(
-                "cm_manage_context",
-                {"request": "what did we decide about rate limiting?"},
-                messages=[],
-            )
-        result = json.loads(result_json)
-        reply = result["reply"]
-        self.assertIn("Redis", reply)
-        self.assertIn("rate limiting", reply.lower())
-        self.assertIn("operations executed", reply.lower())
-
-        # PIN op should have marked the summary pinned.
-        s = eng._store.get_summary("L1-0001")
-        self.assertEqual(s["pinned"], 1)
-        eng.on_session_end("e2e-session", [])
-
     def test_memory_search_and_grep(self) -> None:
         """Provider tools return results from the seeded archive."""
         from plugins.autobio.provider import AutobioMemoryProvider

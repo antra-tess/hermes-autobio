@@ -15,11 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULTS: Dict[str, Any] = {
-    "tail": {
-        "default_tokens": 100_000,
-        "min_tokens": 50_000,
-        "max_tokens": 150_000,
-    },
     "compression": {
         # Weighted-token budget the picker accumulates per L1. Lower
         # values produce more, smaller, denser L1s (faster L2/L3
@@ -31,11 +26,29 @@ DEFAULTS: Dict[str, Any] = {
         # at threshold=6. Tune via ``autobio.compression.chunk_tokens``
         # in user config.
         "chunk_tokens": 6_000,
+        # Tokens of recent raw conversation the chunk picker MUST leave
+        # at the live tail. The picker stops folding once the remaining
+        # uncovered run drops below this. Sized for an agent whose
+        # working memory at any moment includes the recent ~250k of
+        # conversation (long tool chains, narrative continuity, etc.);
+        # raise for longer working windows, lower for short tool-heavy
+        # sessions where aggressive folding is the right tradeoff.
+        # Was previously hardcoded to ``chunk_tokens * 2`` (12k) —
+        # too small for any non-trivial long-lived agent.
+        "protect_last_tokens": 250_000,
         "summary_target_tokens": 2_500,
         "merge_threshold": 6,
         "max_levels": 3,
         "speculative": True,
         "speculative_lead_tokens": 20_000,
+        # Cap on how many UNMERGED L1s can sit in the archive before
+        # speculation pauses. Stops a freshly-seeded archive from
+        # eagerly burning summarizer calls to pre-warm L1s the system
+        # may never need. Default = ``merge_threshold ** (max_levels
+        # - 1)`` ≈ "1 L3 worth" of pre-warmed memories. Once the main
+        # compress path consumes some (folds + merges them), the
+        # active count drops and speculation can resume.
+        "max_speculative_l1s": 36,
         # Weighted chunk sizing: not all tokens cost the same in
         # memory terms. Code/console output is recoverable from disk
         # (CM can re-read or grep), so it gets a discount; user and

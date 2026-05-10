@@ -95,6 +95,27 @@ class SpeculativeWorker:
             if getattr(self._engine, "_compression_halted", False):
                 return
 
+        # Cap on how many active (unmerged) L1s can sit in the archive
+        # before speculation pauses. Default ≈ "1 L3 worth". For a
+        # fresh seed where compress() hasn't run yet (no folds, no
+        # merges), speculation produces L1s until the cap, then stops
+        # until the main compress path consumes some — at which point
+        # the count drops (via merged_into) and speculation resumes.
+        compression_cfg = self._cfg.get("compression", {})
+        merge_threshold = int(compression_cfg.get("merge_threshold", 6))
+        max_levels = int(compression_cfg.get("max_levels", 3))
+        cap = int(compression_cfg.get(
+            "max_speculative_l1s",
+            merge_threshold ** max(1, max_levels - 1),
+        ))
+        active_l1s = int(self._store.summary_counts().get(1, 0) or 0)
+        if active_l1s >= cap:
+            logger.debug(
+                "autobio speculative: paused (active L1s=%d >= cap=%d)",
+                active_l1s, cap,
+            )
+            return
+
         # Reconcile any new content from ``messages`` into the archive
         # before walking. In production this is a no-op (engine has
         # already archived via on_turn_end / compress). For tests that
@@ -255,7 +276,9 @@ def _chunk_bounds_from_archive(
 
     compression_cfg = cfg.get("compression", {})
     chunk_tokens = int(compression_cfg.get("chunk_tokens", 10_000))
-    protect_last = chunk_tokens * 2
+    protect_last = int(compression_cfg.get(
+        "protect_last_tokens", chunk_tokens * 2,
+    ))
     weights_cfg = compression_cfg.get("weights")
 
     chunk_hashes, _doc_context = _pick_archive_chunk(
@@ -287,7 +310,9 @@ def _chunk_bounds_for(
     """
     compression_cfg = cfg.get("compression", {})
     chunk_tokens = int(compression_cfg.get("chunk_tokens", 10_000))
-    protect_last = chunk_tokens * 2
+    protect_last = int(compression_cfg.get(
+        "protect_last_tokens", chunk_tokens * 2,
+    ))
     weights_cfg = compression_cfg.get("weights")
     protected_ranges = (
         store.find_ranges_in_view([message_hash(m) for m in messages])

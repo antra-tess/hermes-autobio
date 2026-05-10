@@ -53,6 +53,10 @@ class ArchiveRoundTrip(unittest.TestCase):
         eng.on_session_start("rt", hermes_home=self.tmp)
         eng.cfg["compression"]["chunk_tokens"] = 4_000
         eng.cfg["compression"]["summary_target_tokens"] = 300
+        # Force pressure so the new compress()-fold gate fires on
+        # this small synthetic corpus (the production threshold of
+        # 75% of context_length would gate the fold off).
+        eng.threshold_tokens = 1_000
 
         # Distinctive content we can identify post-expansion.
         originals: List[Dict[str, Any]] = [
@@ -452,6 +456,8 @@ class SummarizeFoldSemantics(unittest.TestCase):
         eng.cfg["compression"]["speculative"] = False
         if eng._speculative is not None:
             eng._speculative._enabled = False
+        # Force pressure on a small synthetic corpus.
+        eng.threshold_tokens = 1_000
 
         msgs = self._messages()
         start, end = _pick_chunk_bounds(msgs, 3, 4_000, 8_000)
