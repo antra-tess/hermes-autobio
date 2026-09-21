@@ -43,6 +43,27 @@ class AutobioContextEngine(ContextEngine):
     protect_first_n: int = 3
     protect_last_n: int = 6
 
+    # Autobio's SQLite archive is the canonical record of the
+    # conversation; the runner's state.db is auxiliary. Rotating
+    # session_id on every compress() (the runner's default for the
+    # lossy built-in compressor) breaks ``--resume <session>`` by
+    # scattering messages across orphan auto-id sessions. Setting this
+    # to True tells the runner to keep session_id stable across
+    # compress() and re-sync state.db to current conversation_history
+    # via truncate + re-flush instead.
+    preserve_session_on_compress: bool = True
+
+    # Autobio's archive (SQLite at ~/.hermes/memory/autobio/store.db) is
+    # the canonical message store. Hermes' state.db ``messages`` table
+    # is redundant for autobio sessions and historically has been a
+    # *corruption* source (drops the ``_autobio_recall`` dict flag on
+    # round-trip, causing recall-pair body text to come back as plain
+    # assistant content and get re-rendered as a fresh recall pair on
+    # top — the agent's "context corrupted, my previous response was a mess,
+    # duplicated" symptom). Declaring ownership tells the runner: skip
+    # state.db's message load on resume and skip the per-turn flush.
+    owns_message_persistence: bool = True
+
     def __init__(self) -> None:
         self.cfg = load_autobio_config()
         self._session_id: Optional[str] = None
@@ -108,19 +129,29 @@ class AutobioContextEngine(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
-        self.threshold_tokens = max(
-            int(context_length * self.threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
-        )
-        # Clamp protect_last_tokens against the model's actual
-        # threshold. Reserving most of the threshold as raw tail
-        # leaves the chunk picker with no room to fold under
-        # pressure. Cap at threshold/3, which preserves the
+        # Threshold resolution: explicit cfg override wins, then
+        # threshold_percent × context_length, then MINIMUM_CONTEXT_LENGTH
+        # as floor. Override is useful for testing fold scenarios on a
+        # smaller archive than 75% × 1M would normally engage.
+        compression_cfg = self.cfg.setdefault("compression", {})
+        explicit_threshold = compression_cfg.get("threshold_tokens")
+        if explicit_threshold is not None:
+            self.threshold_tokens = max(int(explicit_threshold), MINIMUM_CONTEXT_LENGTH)
+        else:
+            self.threshold_tokens = max(
+                int(context_length * self.threshold_percent),
+                MINIMUM_CONTEXT_LENGTH,
+            )
+        # Clamp protect_last_tokens to threshold/3. Preserves the
         # production default's tail-to-threshold ratio (250k/750k =
         # 1/3 on a 1M model) and degrades sanely on smaller models —
-        # e.g., tests using 100k context get clamped to ~25k tail
-        # rather than nullifying the picker.
-        compression_cfg = self.cfg.setdefault("compression", {})
+        # e.g., tests using 100k context get clamped to 25k tail
+        # rather than nullifying the picker. If the cfg sets tail ==
+        # threshold, the user is asking for no compression headroom;
+        # the clamp gives them ~1/3 of threshold as raw tail and
+        # 2/3 as foldable region. (Tighter caps like
+        # threshold - 2*chunk_tokens leave too little room on small
+        # test corpora and break the picker.)
         cfg_plt = compression_cfg.get("protect_last_tokens")
         if cfg_plt is not None:
             cap = max(self.threshold_tokens // 3, 0)
@@ -371,11 +402,19 @@ class AutobioContextEngine(ContextEngine):
         - Enrich tool results with extension-suffixed tool names
           (see ``tool_naming.enrich_tool_name``) so weights resolve
           ``Read:md`` distinctly from ``Read:py``.
-        - Hash and archive everything else, preserving monotonic
-          positions.
+        - Walk candidates against the visible-archive in lockstep: a
+          candidate that matches the next un-consumed archive entry
+          (by hash, in position order) is treated as already-archived
+          and consumes that entry. A candidate that does NOT match
+          is treated as net-new and gets archived at next_pos.
 
-        Idempotent on hash. Real new messages land in the archive with
-        positions strictly larger than anything already there.
+        The lockstep walk replaces the prior global-hash dedup, which
+        silently dropped duplicate-content turns ("ok" said twice,
+        "hi?" sent twice). With compound PK ``(session_id, hash,
+        position)`` allowing the same hash at different positions, the
+        new instance lands at a fresh position and renders correctly.
+        Re-renders of the same conversation still no-op because every
+        candidate consumes exactly the matching archive entry.
         """
         if not self._store:
             return
@@ -383,6 +422,26 @@ class AutobioContextEngine(ContextEngine):
         args_index = build_tool_args_index(messages)
 
         recall_hashes = known_recall_hashes(self._store)
+        # Build the rolling-pointer walk: ALL archive rows for this
+        # session in position order. We don't filter by compressed_into
+        # — folded ranges are simply *skipped over* by the pointer when
+        # a candidate doesn't match the current archive entry, because
+        # they're absent from the rendered view that produced the input
+        # ``messages``. Inputs that DO contain folded raws (e.g. tests
+        # passing raw msg lists, or rollback paths handing back the
+        # original conversation) likewise consume those entries
+        # in-order. Either way each archive position can be matched at
+        # most once.
+        with self._store._lock:
+            archive_rows = self._store._conn.execute(
+                "SELECT hash FROM messages "
+                "WHERE session_id = ? "
+                "ORDER BY position ASC, turn ASC",
+                (self._store.session_id,),
+            ).fetchall()
+        archive_hashes: List[str] = [r["hash"] for r in archive_rows]
+
+        ai = 0
         next_pos = self._next_position()
         current_turn = self._current_turn()
         for msg in messages:
@@ -393,14 +452,28 @@ class AutobioContextEngine(ContextEngine):
                 h = message_hash(enriched)
                 if h in recall_hashes:
                     continue   # belt-and-braces: matches an active marker
-                # If already archived, upsert is a no-op via INSERT OR
-                # IGNORE. Position passed here is only used on first
-                # insert; if the row exists it keeps its original.
-                if self._store.get_message(h) is None:
-                    self._store.upsert_message(
-                        h, enriched, turn=current_turn, position=next_pos,
-                    )
-                    next_pos += 1
+                # Scan forward from ai for an archive entry matching h.
+                # Skipped entries (between current ai and the match)
+                # represent folded ranges that don't appear in the
+                # rendered view — already archived, no action needed.
+                j = ai
+                while j < len(archive_hashes) and archive_hashes[j] != h:
+                    j += 1
+                if j < len(archive_hashes):
+                    # Found a match — already archived. Consume it.
+                    ai = j + 1
+                    continue
+                # Reached end of archive without a match — net-new.
+                # Archive at next_pos. Compound PK admits the row even
+                # if its hash already exists at an earlier position
+                # (the duplicate-content-at-different-turn case).
+                self._store.upsert_message(
+                    h, enriched, turn=current_turn, position=next_pos,
+                )
+                # Reflect the new row in the local walk so subsequent
+                # candidates with the same hash don't re-consume it.
+                archive_hashes.append(h)
+                next_pos += 1
             except Exception as e:
                 logger.error(
                     "autobio reconcile: archive FAILED for one message "
@@ -483,6 +556,24 @@ class AutobioContextEngine(ContextEngine):
         from .compression import ModelInfo
         from .speculative import SpeculativeWorker
 
+        # Optional alias: when set, the autobio archive is keyed under
+        # this fixed session_id regardless of what session_id Hermes
+        # passes from its own session machinery (per-chat for the
+        # gateway, per-conversation for chat). Lets a single
+        # autobiographical record back multiple Hermes sessions —
+        # useful when one agent serves multiple platforms / DMs / group
+        # channels and you want unified memory across all of them.
+        # Hermes' own state.db remains scoped by its session_id; only
+        # autobio's archive is unified.
+        alias = self.cfg.get("alias_session_id")
+        if alias and alias != session_id:
+            logger.info(
+                "autobio engine: alias_session_id=%s in effect; "
+                "Hermes session_id=%s redirected to autobio archive %s",
+                alias, session_id, alias,
+            )
+            session_id = str(alias)
+
         self._session_id = session_id
         self._hermes_home = kwargs.get("hermes_home") or str(Path.home() / ".hermes")
         self._store = get_store(
@@ -521,15 +612,29 @@ class AutobioContextEngine(ContextEngine):
                 failures, len(messages), session_id,
             )
 
-        # Wait briefly for in-flight speculative work; logs from the
-        # store close path catch any lingering writes.
+        # Wait briefly for in-flight speculative work.
         if self._speculative is not None:
             self._speculative.shutdown()
             self._speculative = None
-        if self._hermes_home and self._session_id:
-            close_store(self._hermes_home, self._session_id)
+
+        # NOTE: we deliberately do NOT close the store here.
+        #
+        # Gateway-pattern callers (Hermes' messaging gateway) reuse the
+        # autobio engine instance across many "session_end / session_start"
+        # cycles within one process — each Telegram/Discord/etc. turn
+        # finalizes the prior session and opens the next. Closing the
+        # SQLite connection in on_session_end would invalidate any
+        # lingering ``self._store`` reference, producing
+        # ``sqlite3.ProgrammingError: Cannot operate on a closed
+        # database`` on the next turn (which observed in production
+        # after exactly one Telegram message round-trip).
+        #
+        # The store is process-scoped via the module-level ``_STORES``
+        # singleton; SQLite connections are cheap to keep open, and OS
+        # cleanup at process exit is sufficient. Speculative shutdown
+        # above already drains in-flight summarizer work so the store
+        # is in a quiescent state.
         _ACTIVE_ENGINES.pop(session_id, None)
-        self._store = None
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
@@ -732,13 +837,14 @@ class AutobioContextEngine(ContextEngine):
     def _archive_live(self, messages: List[Dict[str, Any]]) -> int:
         """Hash and archive every NON-MARKER message in the live list.
 
-        Idempotent via ``INSERT OR IGNORE`` on the content hash. Stale
-        render markers from prior compress() calls are recognized via
+        Uses the same rolling-pointer walk as ``_reconcile_with_archive``
+        — each archive position can be matched at most once, so
+        duplicate-content turns ("ok" said twice, "hi?" sent twice)
+        each get their own archive row at distinct positions instead
+        of the second silently colliding with the first. Stale render
+        markers from prior compress() calls are recognized via
         :func:`is_recall_message` plus a hash check against
-        ``known_recall_hashes`` and explicitly skipped — archiving them
-        as messages would let the picker see them as foldable content,
-        producing the recursive Torment Nexus the projection model
-        was designed to prevent.
+        ``known_recall_hashes`` and explicitly skipped.
 
         Tool results are enriched with their resolved tool name (and
         for ``Read``-family tools, a ``:ext`` suffix derived from the
@@ -746,9 +852,8 @@ class AutobioContextEngine(ContextEngine):
         lookup can distinguish ``Read:md`` (a document — full weight)
         from ``Read:py`` (source code — discounted).
 
-        Uses monotonic positions seeded from MAX(position) so positions
-        survive renders. After archival, tool results over the
-        configured threshold are auto-marked as documents.
+        After archival, newly-archived tool results over the configured
+        threshold are auto-marked as documents.
 
         Returns the count of messages that FAILED to archive.
         """
@@ -762,6 +867,16 @@ class AutobioContextEngine(ContextEngine):
         args_index = build_tool_args_index(messages)
 
         recall_hashes = known_recall_hashes(self._store)
+        with self._store._lock:
+            archive_rows = self._store._conn.execute(
+                "SELECT hash FROM messages "
+                "WHERE session_id = ? "
+                "ORDER BY position ASC, turn ASC",
+                (self._store.session_id,),
+            ).fetchall()
+        archive_hashes: List[str] = [r["hash"] for r in archive_rows]
+
+        ai = 0
         next_pos = self._next_position()
         current_turn = self._current_turn()
         failure_count = 0
@@ -769,18 +884,22 @@ class AutobioContextEngine(ContextEngine):
             try:
                 if is_recall_message(msg):
                     continue
-                # Enrich tool results with extension-suffixed name so
-                # the hash and the stored row agree (and so the picker
-                # weight lookup picks up Read:md vs Read:py).
                 enriched = enrich_tool_name(msg, args_index)
                 h = message_hash(enriched)
                 if h in recall_hashes:
                     continue   # belt-and-braces
-                if self._store.get_message(h) is not None:
+                # Try to consume the next un-consumed archive entry.
+                j = ai
+                while j < len(archive_hashes) and archive_hashes[j] != h:
+                    j += 1
+                if j < len(archive_hashes):
+                    ai = j + 1
                     continue   # already archived
+                # Net-new content — archive at next_pos.
                 self._store.upsert_message(
                     h, enriched, turn=current_turn, position=next_pos,
                 )
+                archive_hashes.append(h)
                 next_pos += 1
                 self._maybe_auto_mark_document(h, enriched)
             except Exception as e:

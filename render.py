@@ -399,12 +399,24 @@ def _sanitize_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         role = m.get("role")
         if role == "assistant" and (m.get("tool_calls") or []):
             tcs = m["tool_calls"]
-            # Lookahead: next user/system OR end-of-list.
+            # Lookahead: next user/system, OR the next
+            # assistant-with-tool_calls (which starts its own window)
+            # OR end-of-list. Without the assistant-with-tool_calls
+            # break, the first assistant's lookahead would swallow
+            # the SECOND assistant's tool results — passing the
+            # ``in available_results`` check globally but failing the
+            # ``in kept_ids`` per-assistant check below, dropping the
+            # second tool_result entirely. (Bug observed in production
+            # when the agent ran two memory_search calls back-to-back.)
             j = i + 1
             available_results: set = set()
             while j < n and messages[j].get("role") not in ("user", "system"):
-                if messages[j].get("role") == "tool":
-                    cid = messages[j].get("tool_call_id")
+                msg_j = messages[j]
+                if (msg_j.get("role") == "assistant"
+                        and msg_j.get("tool_calls")):
+                    break
+                if msg_j.get("role") == "tool":
+                    cid = msg_j.get("tool_call_id")
                     if cid:
                         available_results.add(cid)
                 j += 1

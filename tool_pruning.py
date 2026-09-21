@@ -98,6 +98,17 @@ def prune_tool_results(
     if store is not None:
         from .tool_naming import build_tool_args_index, enrich_tool_name
         args_index = build_tool_args_index(messages)
+        # Snapshot next-archive position once; only used when we need to
+        # archive a not-yet-archived tool result. Reconcile and
+        # _archive_live should already cover everything in normal
+        # flow, but this defensive pass catches the edge cases.
+        with store._lock:
+            row = store._conn.execute(
+                "SELECT COALESCE(MAX(position), -1) FROM messages "
+                "WHERE session_id = ?",
+                (store.session_id,),
+            ).fetchone()
+        next_pos = (row[0] if row else -1) + 1
         for i, msg in enumerate(messages):
             if msg.get("role") != "tool":
                 continue
@@ -120,11 +131,18 @@ def prune_tool_results(
                         msg.get("tool_call_id", ""), ("unknown", ""),
                     )[0] or "unknown"
                 h = message_hash(enriched)
-                store.upsert_message(
-                    h, enriched,
-                    turn=current_turn, position=i,
-                    tokens=len(content_str) // _CHARS_PER_TOKEN,
-                )
+                # Already archived (by reconcile / _archive_live)? Skip
+                # the upsert. With compound PK ``(session_id, hash,
+                # position)``, passing the live-view index ``i`` here
+                # would create a phantom row at a position the picker
+                # doesn't expect, breaking source_hash continuity.
+                if store.get_message(h) is None:
+                    store.upsert_message(
+                        h, enriched,
+                        turn=current_turn, position=next_pos,
+                        tokens=len(content_str) // _CHARS_PER_TOKEN,
+                    )
+                    next_pos += 1
                 archived_ok.add(i)
                 stats.archived_count += 1
             except Exception as e:

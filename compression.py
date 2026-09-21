@@ -177,20 +177,34 @@ def summarize_chunk(
     # Defensive archive: any caller (main compress, speculative worker,
     # direct test invocation) must end up with the chunk's messages in
     # the archive — otherwise the L1's source_hashes point to rows
-    # that don't exist. upsert_message is INSERT OR IGNORE, so if the
-    # engine already archived these (via compress() or on_turn_end),
-    # these calls are no-ops. We deliberately pass turn=None here —
-    # correct turn numbers are set by the archival path that knew the
-    # turn counter at the time. Overwriting with a guess would corrupt
-    # the derived turn-range lookup.
+    # that don't exist.
+    #
+    # Insert-if-missing on hash. We deliberately do NOT pass
+    # ``chunk_start + offset`` as the position — under the compound PK
+    # ``(session_id, hash, position)``, that creates phantom duplicate
+    # rows at positions the picker never expects when the engine
+    # already archived these via reconcile / on_turn_end at different
+    # positions. Only when truly missing (rare — speculation called in
+    # isolation, or a test driving summarize_chunk directly) do we
+    # archive at a fresh monotonic position.
     upsert_failures: List[int] = []
+    with store._lock:
+        max_pos_row = store._conn.execute(
+            "SELECT COALESCE(MAX(position), -1) FROM messages "
+            "WHERE session_id = ?",
+            (store.session_id,),
+        ).fetchone()
+    next_pos = (max_pos_row[0] if max_pos_row else -1) + 1
     for offset, m in enumerate(chunk):
         try:
+            if store.get_message(chunk_hashes[offset]) is not None:
+                continue   # already archived; preserve original position
             store.upsert_message(
                 chunk_hashes[offset], m,
                 turn=None,
-                position=chunk_start + offset,
+                position=next_pos,
             )
+            next_pos += 1
         except Exception as e:
             logger.error(
                 "summarize_chunk: upsert FAILED at offset %d: %s", offset, e,

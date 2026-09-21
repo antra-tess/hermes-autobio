@@ -38,6 +38,14 @@ class AutobioMemoryProvider(MemoryProvider):
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        # Optional alias — see AutobioContextEngine.on_session_start
+        # for rationale. Provider must use the same alias so its
+        # search/grep/read tools surface the same archive that the
+        # engine half is writing to.
+        alias = self.cfg.get("alias_session_id")
+        if alias and alias != session_id:
+            session_id = str(alias)
+
         self._session_id = session_id
         self._hermes_home = kwargs.get("hermes_home") or str(Path.home() / ".hermes")
         self._store = get_store(

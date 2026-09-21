@@ -61,11 +61,31 @@ def close_store(hermes_home: str, session_id: str) -> None:
 
 
 SCHEMA = """
+-- PRIMARY KEY is (session_id, hash, position) rather than just hash.
+--
+-- Reasoning: with hash as global PK, the same content can appear at
+-- most once in the archive — including when a user genuinely says the
+-- same thing twice ("ok", "hi?", "yes") at different turns. The
+-- reconcile path then silently dropped the second occurrence, render
+-- emitted only the first, and any API call with the dedup'd second
+-- as the appended user msg ended up with a tail that didn't include
+-- it (resulting in 400 "must end with user" errors when the archive
+-- ended with an assistant turn).
+--
+-- Compound PK with position lets the same content land at multiple
+-- archive positions naturally. Re-renders of an unchanged tail still
+-- INSERT OR IGNORE no-op because the (session_id, hash, position)
+-- triple matches an existing row exactly.
+--
+-- Cross-session collision (same hash under different session_ids)
+-- is also resolved — useful when alias_session_id merges multiple
+-- Hermes sessions into one autobio archive but the runner still
+-- presents per-channel content to reconcile.
 CREATE TABLE IF NOT EXISTS messages (
-    hash             TEXT PRIMARY KEY,
+    hash             TEXT NOT NULL,
     session_id       TEXT NOT NULL,
     turn             INTEGER,
-    position         INTEGER,
+    position         INTEGER NOT NULL,
     role             TEXT NOT NULL,
     content          TEXT,
     tool_call_id     TEXT,
@@ -79,11 +99,14 @@ CREATE TABLE IF NOT EXISTS messages (
     -- thinking / redacted_thinking blocks (with their signatures);
     -- Hermes' anthropic_adapter reads them back when the message is
     -- replayed to Claude. JSON-serialized list of block dicts.
-    reasoning_details TEXT
+    reasoning_details TEXT,
+    PRIMARY KEY (session_id, hash, position)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session_turn ON messages(session_id, turn);
 CREATE INDEX IF NOT EXISTS idx_messages_tool_call_id ON messages(tool_call_id);
 CREATE INDEX IF NOT EXISTS idx_messages_compressed_into ON messages(compressed_into);
+CREATE INDEX IF NOT EXISTS idx_messages_session_position ON messages(session_id, position);
+CREATE INDEX IF NOT EXISTS idx_messages_session_hash ON messages(session_id, hash);
 
 CREATE TABLE IF NOT EXISTS summaries (
     id                      TEXT PRIMARY KEY,
@@ -245,8 +268,95 @@ class Store:
         existing table, so additive column changes need explicit
         ``ALTER TABLE`` guarded by an existence check. Each migration
         here is safe to re-run on an up-to-date schema.
+
+        Order matters: additive column migrations on ``messages`` MUST
+        run before the PK rebuild below, so the rebuilt table has all
+        the columns the SELECT-INSERT step expects.
         """
         with self._lock:
+            # Pre-PK additive column migrations (so the PK rebuild has
+            # the full column set to copy).
+            try:
+                msg_info_pre = self._conn.execute(
+                    "PRAGMA table_info(messages)"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                msg_info_pre = []
+            pre_cols = {r["name"] for r in msg_info_pre}
+            if msg_info_pre and "reasoning_details" not in pre_cols:
+                self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN reasoning_details TEXT"
+                )
+                logger.info(
+                    "autobio: migrated messages table "
+                    "(added reasoning_details column)"
+                )
+
+            # PK migration: messages.hash → (session_id, hash, position).
+            # Detect old PK by inspecting messages columns; if exactly
+            # one column is marked pk=1 and that column is hash, rebuild.
+            try:
+                msg_info = self._conn.execute(
+                    "PRAGMA table_info(messages)"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                msg_info = []
+            pk_cols = [r["name"] for r in msg_info if r["pk"]]
+            if pk_cols == ["hash"]:
+                logger.info(
+                    "autobio: migrating messages PK from hash → "
+                    "(session_id, hash, position)"
+                )
+                # Backfill any NULL positions with rowid before adding
+                # NOT NULL constraint. Old code paths always supplied
+                # positions, but defensive against any edge cases.
+                self._conn.execute(
+                    "UPDATE messages SET position = rowid "
+                    "WHERE position IS NULL"
+                )
+                self._conn.executescript("""
+                    ALTER TABLE messages RENAME TO messages_old_pk;
+                    CREATE TABLE messages (
+                        hash             TEXT NOT NULL,
+                        session_id       TEXT NOT NULL,
+                        turn             INTEGER,
+                        position         INTEGER NOT NULL,
+                        role             TEXT NOT NULL,
+                        content          TEXT,
+                        tool_call_id     TEXT,
+                        tool_calls       TEXT,
+                        tool_name        TEXT,
+                        tokens           INTEGER,
+                        created_at       TEXT NOT NULL,
+                        compressed_into  TEXT,
+                        reasoning_details TEXT,
+                        PRIMARY KEY (session_id, hash, position)
+                    );
+                    INSERT INTO messages
+                        SELECT hash, session_id, turn, position, role,
+                               content, tool_call_id, tool_calls,
+                               tool_name, tokens, created_at,
+                               compressed_into, reasoning_details
+                        FROM messages_old_pk;
+                    DROP TABLE messages_old_pk;
+                    CREATE INDEX IF NOT EXISTS idx_messages_session_turn
+                        ON messages(session_id, turn);
+                    CREATE INDEX IF NOT EXISTS idx_messages_tool_call_id
+                        ON messages(tool_call_id);
+                    CREATE INDEX IF NOT EXISTS idx_messages_compressed_into
+                        ON messages(compressed_into);
+                    CREATE INDEX IF NOT EXISTS idx_messages_session_position
+                        ON messages(session_id, position);
+                    CREATE INDEX IF NOT EXISTS idx_messages_session_hash
+                        ON messages(session_id, hash);
+                """)
+                logger.info(
+                    "autobio: messages PK migration complete (%d rows)",
+                    self._conn.execute(
+                        "SELECT COUNT(*) FROM messages"
+                    ).fetchone()[0],
+                )
+
             pin_cols = {
                 row["name"] for row in self._conn.execute(
                     "PRAGMA table_info(pins)"
@@ -467,22 +577,43 @@ class Store:
                 )
 
     def get_message(self, hash_id: str) -> Optional[Dict[str, Any]]:
+        """Return the earliest-position row matching ``hash_id``.
+
+        With compound PK ``(session_id, hash, position)``, a single hash
+        can have multiple rows (duplicate content at different turns).
+        Callers like pin / compressed_into reference resolution want a
+        stable, deterministic answer — the first occurrence is the
+        natural choice and preserves current behavior for the typical
+        case where each hash is unique within session.
+        """
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM messages WHERE hash = ?", (hash_id,)
+                "SELECT * FROM messages WHERE hash = ? "
+                "ORDER BY session_id, position ASC LIMIT 1",
+                (hash_id,),
             ).fetchone()
         return dict(row) if row else None
 
     def get_messages_by_hashes(self, hashes: List[str]) -> List[Dict[str, Any]]:
-        """Return archived messages for a list of hashes, preserving order."""
+        """Return archived messages for a list of hashes, preserving order.
+
+        Same first-occurrence semantics as ``get_message`` — for each
+        hash, the earliest-position row wins.
+        """
         if not hashes:
             return []
         placeholders = ",".join("?" * len(hashes))
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT * FROM messages WHERE hash IN ({placeholders})", hashes
+                f"SELECT * FROM messages WHERE hash IN ({placeholders}) "
+                f"ORDER BY position ASC",
+                hashes,
             ).fetchall()
-        by_hash = {row["hash"]: dict(row) for row in rows}
+        by_hash: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            d = dict(row)
+            # First-occurrence wins (rows are sorted by position ASC).
+            by_hash.setdefault(d["hash"], d)
         return [by_hash[h] for h in hashes if h in by_hash]
 
     def get_tool_result(self, tool_call_id: str) -> Optional[Dict[str, Any]]:

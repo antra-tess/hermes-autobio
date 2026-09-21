@@ -19,8 +19,11 @@ exports/
 
 # Per-instance transfer artefacts — personal session data that should
 # never be checked in. Drop into the repo root for ingest, then leave.
-canonical_request_log.json
+canonical_request_log*.json
 conversation-*.json
+
+# Deployment post-mortems — name specific instances; kept local.
+docs/architectural-issues.md
 
 # Editor scratch.
 .idea/
