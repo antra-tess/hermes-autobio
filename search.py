@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -245,22 +246,28 @@ def expand_summary(
 # Helpers
 # ---------------------------------------------------------------------------
 
-_FTS_SPECIAL = re.compile(r'["\'()\-*]')
-
-
 def _sanitize_fts_query(q: str) -> str:
     """Coerce a user query into something FTS5 accepts.
 
     FTS5's query language treats quotes, parens, and other tokens
-    specially. For our purposes, we just strip them and treat the rest
-    as a phrase / prefix search with implicit AND between terms.
+    specially. Split the query into words the way the default unicode61
+    tokenizer does (letters, numbers, nonspacing marks and private-use
+    characters),
+    quote each as a literal prefix, and join with OR so a natural-language
+    question can partially match. Quoting also keeps words such as OR and
+    NOT from becoming operators.
     """
-    cleaned = _FTS_SPECIAL.sub(" ", q or "").strip()
-    if not cleaned:
+    terms: List[str] = []
+    word: List[str] = []
+    for ch in q or "":
+        cat = unicodedata.category(ch)
+        if cat[0] in "LN" or cat in ("Mn", "Co"):
+            word.append(ch)
+        elif word:
+            terms.append("".join(word))
+            word = []
+    if word:
+        terms.append("".join(word))
+    if not terms:
         return ""
-    # Use OR between terms so partial matches still surface; callers can
-    # pass quoted phrases if they want AND semantics.
-    terms = cleaned.split()
-    if len(terms) == 1:
-        return terms[0] + "*"
-    return " OR ".join(t + "*" for t in terms)
+    return " OR ".join('"' + t + '"*' for t in terms)
